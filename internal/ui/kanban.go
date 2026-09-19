@@ -1333,13 +1333,7 @@ func (k *KanbanBoard) renderTaskCard(task *db.Task, width int, isSelected bool) 
 
 	// Project tag
 	if task.Project != "" {
-		shortProject := task.Project
-		switch task.Project {
-		case "offerlab":
-			shortProject = "ol"
-		case "influencekit":
-			shortProject = "ik"
-		}
+		shortProject := ShortProjectName(task.Project)
 		if isSelected {
 			b.WriteString(" [" + shortProject + "]")
 		} else {

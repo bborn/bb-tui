@@ -16,7 +16,7 @@ import (
 // name that does not exist. The failure is remote from its cause — a pipeline
 // aborting with
 //
-//	fatal: cannot change to '~/Projects/rails/offerlab': No such file or directory
+//	fatal: cannot change to '~/Projects/rails/acme': No such file or directory
 //
 // and a GetProjectByPath that silently never matches, so project detection and
 // project-local workflow dirs quietly do nothing.

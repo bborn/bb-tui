@@ -537,7 +537,7 @@ func (m *CommandPaletteModel) matchesQuery(task *db.Task, query string) bool {
 	if task.SourceBranch != "" && strings.Contains(strings.ToLower(task.SourceBranch), query) {
 		return true
 	}
-	// Check PR URL (e.g., "https://github.com/offerlab/offerlab/pull/2382")
+	// Check PR URL (e.g., "https://github.com/owner/repo/pull/2382")
 	if task.PRURL != "" && strings.Contains(strings.ToLower(task.PRURL), query) {
 		return true
 	}
@@ -922,13 +922,7 @@ func (m *CommandPaletteModel) renderTaskItem(task *db.Task, isSelected bool, wid
 	// Project tag
 	if task.Project != "" {
 		projectStyle := lipgloss.NewStyle().Foreground(ProjectColor(task.Project))
-		shortProject := task.Project
-		switch task.Project {
-		case "offerlab":
-			shortProject = "ol"
-		case "influencekit":
-			shortProject = "ik"
-		}
+		shortProject := ShortProjectName(task.Project)
 		line.WriteString(projectStyle.Render("[" + shortProject + "]"))
 		line.WriteString(" ")
 	}

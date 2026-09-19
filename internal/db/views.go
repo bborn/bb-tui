@@ -9,7 +9,7 @@ import (
 // SavedView is a named filter query — "the tasks I care about right now".
 //
 // A view is nothing but its query string, in the grammar internal/taskfilter
-// parses ("status:in-progress status:blocked", "is:pinned", "[offerlab]"). That
+// parses ("status:in-progress status:blocked", "is:pinned", "[acme]"). That
 // keeps every surface honest: the TUI, the CLI and the HTTP API all resolve a
 // view name to the same string and run the same matcher over it, so a view
 // cannot mean one thing on the board and another in a script.

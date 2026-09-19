@@ -347,16 +347,10 @@ func isActiveStatus(status string) bool {
 	return status == db.StatusProcessing || status == db.StatusBlocked
 }
 
-// shortProjectName abbreviates the long project names that would otherwise eat
-// a third of a narrow row. Mirrors the kanban card's abbreviations.
+// shortProjectName abbreviates a project name that would otherwise eat a third
+// of a narrow row. Mirrors the kanban card.
 func shortProjectName(project string) string {
-	switch project {
-	case "offerlab":
-		return "ol"
-	case "influencekit":
-		return "ik"
-	}
-	return project
+	return ShortProjectName(project)
 }
 
 // handleClickList maps a click to the row under it, selecting that task.

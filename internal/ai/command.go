@@ -147,7 +147,7 @@ Return a JSON object with these fields:
 	sb.WriteString(`- "create task about fixing auth bug" -> {"type":"create_task","title":"Fix auth bug","message":"Creating task: Fix auth bug"}
 - "move #42 to done" -> {"type":"update_status","task_id":42,"status":"done","message":"Marking task #42 as done"}
 - "close task 15" -> {"type":"update_status","task_id":15,"status":"done","message":"Closing task #15"}
-- "new task in offerlab: add dark mode" -> {"type":"create_task","title":"Add dark mode","project":"offerlab","message":"Creating task in offerlab: Add dark mode"}
+- "new task in acme: add dark mode" -> {"type":"create_task","title":"Add dark mode","project":"acme","message":"Creating task in acme: Add dark mode"}
 - "go to task 7" -> {"type":"select_task","task_id":7,"message":"Opening task #7"}
 - "find tasks about authentication" -> {"type":"search_tasks","query":"authentication","message":"Searching for tasks about authentication"}
 - "queue task #20" -> {"type":"update_status","task_id":20,"status":"queued","message":"Queuing task #20"}

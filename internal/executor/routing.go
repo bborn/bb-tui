@@ -67,8 +67,8 @@ func (e *Executor) routeTask(ctx context.Context, task *db.Task, allowHold bool)
 	// A project that names its own config dir has already chosen a profile, and
 	// that choice is load-bearing: a config dir carries the account's MCP
 	// connectors and their OAuth logins, which are per-profile and cannot be
-	// shared. Routing an influencekit task onto a personal profile doesn't error
-	// — it silently runs without the Linear/InfluenceKit servers it needs, and
+	// shared. Routing a work task onto a personal profile doesn't error
+	// — it silently runs without the servers it needs, and
 	// the agent works around the gap. So pinning a project is also how you opt it
 	// out of routing.
 	if project := e.projectConfigDir(task.Project); project != "" {

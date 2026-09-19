@@ -4463,7 +4463,7 @@ func FindClaudeSessionID(workDir string) string {
 // findClaudeSessionIDImpl is the shared implementation
 func findClaudeSessionIDImpl(workDir, configDir string) string {
 	// Claude stores sessions in CLAUDE_CONFIG_DIR/projects/<escaped-path>/
-	// The path is escaped: /Users/bruno/foo -> -Users-bruno-foo
+	// The path is escaped: /Users/you/foo -> -Users-you-foo
 	baseDir := ResolveClaudeConfigDir(configDir)
 
 	// Escape the workDir path to match Claude's project directory naming
