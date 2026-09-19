@@ -1,0 +1,54 @@
+version: 2
+
+builds:
+  - id: bb-tui
+    main: ./cmd/bb-tui
+    binary: bb-tui
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: bb-tui
+    ids:
+      - bb-tui
+    formats: [tar.gz]
+    name_template: "bb-tui_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+homebrew_casks:
+  - name: bb-tui
+    ids:
+      - bb-tui
+    repository:
+      owner: bborn
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://github.com/bborn/bb-tui
+    description: A terminal UI for bb
+    # Downloaded binaries are quarantined by Gatekeeper; clearing the attribute
+    # is what lets a cask-installed binary run without a right-click dance.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr",
+                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/bb-tui"]
+          end
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

@@ -18,16 +18,30 @@ each, with a composer underneath.
 
 ![Skill completion](docs/screenshots/skills.png)
 
-## Build
+## Install
 
+With Go:
+
+    go install github.com/bborn/bb-tui/cmd/bb-tui@latest
+
+With Homebrew, once a release is tagged:
+
+    brew install bborn/tap/bb-tui
+
+Or take a binary from the [releases page](https://github.com/bborn/bb-tui/releases)
+— macOS and Linux, arm64 and amd64.
+
+From source:
+
+    git clone https://github.com/bborn/bb-tui && cd bb-tui
     go build -o bin/bb-tui ./cmd/bb-tui
 
 ## Run
 
-    bin/bb-tui
+    bb-tui
 
-It finds the bb server through `BB_SERVER_URL`, then `~/.bb/bb-app-runtime.json`,
-then `http://127.0.0.1:38886`. TUI-local state — themes, saved views,
+bb has to be running. bb-tui finds its server through `BB_SERVER_URL`, then
+`~/.bb/bb-app-runtime.json`, then `http://127.0.0.1:38886`. TUI-local state — themes, saved views,
 keybindings — lives in `~/.bb-tui/`; everything about threads comes from bb and
 is never written locally.
 
