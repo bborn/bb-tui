@@ -3337,6 +3337,22 @@ func (m *AppModel) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Stop the run, the way the app's composer stop control does. Available
+	// whether or not the composer has focus, since a runaway turn is the moment
+	// a reader is least likely to be typing.
+	if m.detailView != nil && keyMsg.String() == "ctrl+s" && StopTaskHook != nil {
+		if task := m.selectedTask; task != nil {
+			id := task.ID
+			m.setBanner("stopping…")
+			return m, func() tea.Msg {
+				if err := StopTaskHook(id); err != nil {
+					return composerFailedMsg{err: err}
+				}
+				return composerSentMsg{}
+			}
+		}
+	}
+
 	// Mouse capture is what lets cards and the composer be clicked, and it is
 	// also what stops the terminal selecting text. ctrl+t hands selection back.
 	if m.detailView != nil && keyMsg.String() == "ctrl+t" {

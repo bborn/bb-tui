@@ -4,11 +4,11 @@ import "testing"
 
 func TestPrettyPermissionUsesTheAppsWording(t *testing.T) {
 	cases := map[string]string{
-		"full":         "Full Access",
-		"auto":         "Auto",
-		"accept-edits": "Accept Edits",
-		"default":      "Ask",
-		"":             "",
+		"full":          "Full Access",
+		"auto":          "Auto",
+		"accept-edits":  "Accept Edits",
+		"default":       "Ask",
+		"":              "",
 		"something-new": "something-new",
 	}
 	for mode, want := range cases {

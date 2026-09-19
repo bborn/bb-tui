@@ -1,0 +1,1070 @@
+package executor
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bborn/bb-tui/internal/config"
+	"github.com/bborn/bb-tui/internal/db"
+)
+
+// TestExecutorInterfaceImplementation verifies all executors properly implement
+// the session and dangerous mode interface methods.
+func TestExecutorInterfaceImplementation(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{}
+	exec := New(database, cfg)
+
+	tests := []struct {
+		name                  string
+		executorName          string
+		supportsSessionResume bool
+		supportsDangerousMode bool
+		dangerousFlag         string // The flag used for dangerous mode
+	}{
+		{
+			name:                  "Claude executor",
+			executorName:          db.ExecutorClaude,
+			supportsSessionResume: true,
+			supportsDangerousMode: true,
+			dangerousFlag:         "--dangerously-skip-permissions",
+		},
+		{
+			name:                  "Codex executor",
+			executorName:          db.ExecutorCodex,
+			supportsSessionResume: true,
+			supportsDangerousMode: true,
+			dangerousFlag:         "--dangerously-bypass-approvals-and-sandbox",
+		},
+		{
+			name:                  "Gemini executor",
+			executorName:          db.ExecutorGemini,
+			supportsSessionResume: true,
+			supportsDangerousMode: true,
+			dangerousFlag:         "--dangerously-allow-run",
+		},
+		{
+			name:                  "Grok executor",
+			executorName:          db.ExecutorGrok,
+			supportsSessionResume: true,
+			supportsDangerousMode: true,
+			dangerousFlag:         "--always-approve",
+		},
+		{
+			name:                  "Cursor executor",
+			executorName:          db.ExecutorCursor,
+			supportsSessionResume: true,
+			supportsDangerousMode: true,
+			dangerousFlag:         "--force",
+		},
+		{
+			name:                  "OpenClaw executor",
+			executorName:          db.ExecutorOpenClaw,
+			supportsSessionResume: true,
+			supportsDangerousMode: false, // OpenClaw does not support dangerous mode
+			dangerousFlag:         "",
+		},
+		{
+			name:                  "OpenCode executor",
+			executorName:          db.ExecutorOpenCode,
+			supportsSessionResume: false, // OpenCode does not support session resume
+			supportsDangerousMode: false, // OpenCode does not support dangerous mode
+			dangerousFlag:         "",
+		},
+		{
+			name:                  "Pi executor",
+			executorName:          db.ExecutorPi,
+			supportsSessionResume: true,  // Pi supports session resume via --continue
+			supportsDangerousMode: false, // Pi does not support dangerous mode
+			dangerousFlag:         "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := exec.executorFactory.Get(tt.executorName)
+			if executor == nil {
+				t.Fatalf("executor %s not found in factory", tt.executorName)
+			}
+
+			// Test SupportsSessionResume
+			if got := executor.SupportsSessionResume(); got != tt.supportsSessionResume {
+				t.Errorf("SupportsSessionResume() = %v, want %v", got, tt.supportsSessionResume)
+			}
+
+			// Test SupportsDangerousMode
+			if got := executor.SupportsDangerousMode(); got != tt.supportsDangerousMode {
+				t.Errorf("SupportsDangerousMode() = %v, want %v", got, tt.supportsDangerousMode)
+			}
+
+			// Test Name
+			if got := executor.Name(); got != tt.executorName {
+				t.Errorf("Name() = %v, want %v", got, tt.executorName)
+			}
+		})
+	}
+}
+
+// TestBuildCommandDangerousMode tests that BuildCommand correctly includes
+// the dangerous mode flag based on task.DangerousMode field.
+func TestBuildCommandDangerousMode(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{}
+	exec := New(database, cfg)
+
+	// Clear the env var to ensure we're testing the task field
+	os.Unsetenv("WORKTREE_DANGEROUS_MODE")
+
+	tests := []struct {
+		name          string
+		executorName  string
+		dangerousMode bool
+		wantFlag      string
+	}{
+		// Claude tests
+		{
+			name:          "Claude with dangerous mode enabled",
+			executorName:  db.ExecutorClaude,
+			dangerousMode: true,
+			wantFlag:      "--dangerously-skip-permissions",
+		},
+		{
+			name:          "Claude with dangerous mode disabled",
+			executorName:  db.ExecutorClaude,
+			dangerousMode: false,
+			wantFlag:      "",
+		},
+		// Codex tests
+		{
+			name:          "Codex with dangerous mode enabled",
+			executorName:  db.ExecutorCodex,
+			dangerousMode: true,
+			wantFlag:      "--dangerously-bypass-approvals-and-sandbox",
+		},
+		{
+			name:          "Codex with dangerous mode disabled",
+			executorName:  db.ExecutorCodex,
+			dangerousMode: false,
+			wantFlag:      "",
+		},
+		// Gemini tests
+		{
+			name:          "Gemini with dangerous mode enabled",
+			executorName:  db.ExecutorGemini,
+			dangerousMode: true,
+			wantFlag:      "--dangerously-allow-run",
+		},
+		{
+			name:          "Gemini with dangerous mode disabled",
+			executorName:  db.ExecutorGemini,
+			dangerousMode: false,
+			wantFlag:      "",
+		},
+		// Grok tests
+		{
+			name:          "Grok with dangerous mode enabled",
+			executorName:  db.ExecutorGrok,
+			dangerousMode: true,
+			wantFlag:      "--always-approve",
+		},
+		{
+			name:          "Grok with dangerous mode disabled",
+			executorName:  db.ExecutorGrok,
+			dangerousMode: false,
+			wantFlag:      "",
+		},
+		{
+			name:          "Cursor with dangerous mode enabled",
+			executorName:  db.ExecutorCursor,
+			dangerousMode: true,
+			wantFlag:      "--force",
+		},
+		{
+			name:          "Cursor with dangerous mode disabled",
+			executorName:  db.ExecutorCursor,
+			dangerousMode: false,
+			wantFlag:      "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &db.Task{
+				ID:            1,
+				DangerousMode: tt.dangerousMode,
+				Port:          8080,
+				WorktreePath:  "/tmp/test-worktree",
+			}
+
+			executor := exec.executorFactory.Get(tt.executorName)
+			cmd := executor.BuildCommand(task, "", "")
+
+			if tt.wantFlag != "" {
+				if !strings.Contains(cmd, tt.wantFlag) {
+					t.Errorf("BuildCommand() = %q, should contain %q", cmd, tt.wantFlag)
+				}
+			} else {
+				// Should NOT contain any dangerous flag
+				dangerousFlags := []string{
+					"--dangerously-skip-permissions",
+					"--dangerously-bypass-approvals-and-sandbox",
+					"--dangerously-allow-run",
+					"--always-approve",
+					"--force",
+					"--yolo",
+				}
+				for _, flag := range dangerousFlags {
+					if strings.Contains(cmd, flag) {
+						t.Errorf("BuildCommand() = %q, should NOT contain %q", cmd, flag)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBuildCommandDangerousModeEnvVar tests that WORKTREE_DANGEROUS_MODE env var
+// also enables dangerous mode even when task.DangerousMode is false.
+func TestBuildCommandDangerousModeEnvVar(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{}
+	exec := New(database, cfg)
+
+	// Set the env var
+	os.Setenv("WORKTREE_DANGEROUS_MODE", "1")
+	defer os.Unsetenv("WORKTREE_DANGEROUS_MODE")
+
+	task := &db.Task{
+		ID:            1,
+		DangerousMode: false, // Task field is false
+		Port:          8080,
+		WorktreePath:  "/tmp/test-worktree",
+	}
+
+	tests := []struct {
+		executorName string
+		wantFlag     string
+	}{
+		{db.ExecutorClaude, "--dangerously-skip-permissions"},
+		{db.ExecutorCodex, "--dangerously-bypass-approvals-and-sandbox"},
+		{db.ExecutorGemini, "--dangerously-allow-run"},
+		{db.ExecutorGrok, "--always-approve"},
+		{db.ExecutorCursor, "--force"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.executorName, func(t *testing.T) {
+			executor := exec.executorFactory.Get(tt.executorName)
+			cmd := executor.BuildCommand(task, "", "")
+
+			if !strings.Contains(cmd, tt.wantFlag) {
+				t.Errorf("BuildCommand() with WORKTREE_DANGEROUS_MODE=1 should contain %q, got %q", tt.wantFlag, cmd)
+			}
+		})
+	}
+}
+
+// TestBuildGeminiDangerousFlag tests the Gemini dangerous flag builder
+// including the GEMINI_DANGEROUS_ARGS customization.
+func TestBuildGeminiDangerousFlag(t *testing.T) {
+	// Clear env vars before test
+	os.Unsetenv("WORKTREE_DANGEROUS_MODE")
+	os.Unsetenv("GEMINI_DANGEROUS_ARGS")
+
+	t.Run("returns empty when not enabled", func(t *testing.T) {
+		got := buildGeminiDangerousFlag(false)
+		if got != "" {
+			t.Errorf("buildGeminiDangerousFlag(false) = %q, want empty", got)
+		}
+	})
+
+	t.Run("returns default flag when enabled", func(t *testing.T) {
+		got := buildGeminiDangerousFlag(true)
+		want := "--dangerously-allow-run "
+		if got != want {
+			t.Errorf("buildGeminiDangerousFlag(true) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("respects WORKTREE_DANGEROUS_MODE env var", func(t *testing.T) {
+		os.Setenv("WORKTREE_DANGEROUS_MODE", "1")
+		defer os.Unsetenv("WORKTREE_DANGEROUS_MODE")
+
+		got := buildGeminiDangerousFlag(false) // false but env var is set
+		want := "--dangerously-allow-run "
+		if got != want {
+			t.Errorf("buildGeminiDangerousFlag(false) with WORKTREE_DANGEROUS_MODE=1 = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("respects GEMINI_DANGEROUS_ARGS customization", func(t *testing.T) {
+		os.Setenv("GEMINI_DANGEROUS_ARGS", "--custom-flag --another-flag")
+		defer os.Unsetenv("GEMINI_DANGEROUS_ARGS")
+
+		got := buildGeminiDangerousFlag(true)
+		want := "--custom-flag --another-flag "
+		if got != want {
+			t.Errorf("buildGeminiDangerousFlag(true) with custom args = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("adds trailing space if not present", func(t *testing.T) {
+		os.Setenv("GEMINI_DANGEROUS_ARGS", "--no-trailing-space")
+		defer os.Unsetenv("GEMINI_DANGEROUS_ARGS")
+
+		got := buildGeminiDangerousFlag(true)
+		if !strings.HasSuffix(got, " ") {
+			t.Errorf("buildGeminiDangerousFlag should add trailing space, got %q", got)
+		}
+	})
+}
+
+// TestFindCodexSessionID tests the Codex session discovery function.
+func TestFindCodexSessionID(t *testing.T) {
+	// Create a unique test work directory
+	testWorkDir := t.TempDir()
+
+	t.Run("returns empty for non-existent sessions directory", func(t *testing.T) {
+		home := t.TempDir()
+		result := findCodexSessionIDInDir(testWorkDir, filepath.Join(home, ".codex", "sessions"))
+		if result != "" {
+			t.Errorf("expected empty string for non-existent directory, got %q", result)
+		}
+	})
+
+	t.Run("finds session matching workDir", func(t *testing.T) {
+		home := t.TempDir()
+		// Create the sessions directory
+		sessionsDir := filepath.Join(home, ".codex", "sessions")
+		if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+			t.Fatalf("Could not create sessions directory: %v", err)
+		}
+
+		// Create a session file that contains the workDir
+		sessionFile := filepath.Join(sessionsDir, "test-session-12345.json")
+		sessionContent := `{"workDir": "` + testWorkDir + `", "data": "test"}`
+		if err := os.WriteFile(sessionFile, []byte(sessionContent), 0644); err != nil {
+			t.Fatalf("Could not create session file: %v", err)
+		}
+
+		result := findCodexSessionIDInDir(testWorkDir, filepath.Join(home, ".codex", "sessions"))
+		if result != "test-session-12345" {
+			t.Errorf("expected 'test-session-12345', got %q", result)
+		}
+	})
+
+	t.Run("returns most recent matching session", func(t *testing.T) {
+		home := t.TempDir()
+		sessionsDir := filepath.Join(home, ".codex", "sessions")
+		if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+			t.Fatalf("Could not create sessions directory: %v", err)
+		}
+
+		// Create older session
+		olderSession := filepath.Join(sessionsDir, "older-session.json")
+		if err := os.WriteFile(olderSession, []byte(`{"workDir": "`+testWorkDir+`"}`), 0644); err != nil {
+			t.Fatalf("Could not create session file: %v", err)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+
+		// Create newer session
+		newerSession := filepath.Join(sessionsDir, "newer-session.json")
+		if err := os.WriteFile(newerSession, []byte(`{"workDir": "`+testWorkDir+`"}`), 0644); err != nil {
+			t.Fatalf("Could not create session file: %v", err)
+		}
+
+		result := findCodexSessionIDInDir(testWorkDir, filepath.Join(home, ".codex", "sessions"))
+		if result != "newer-session" {
+			t.Errorf("expected 'newer-session' (most recent), got %q", result)
+		}
+	})
+
+	t.Run("ignores sessions for other workDirs", func(t *testing.T) {
+		home := t.TempDir()
+		sessionsDir := filepath.Join(home, ".codex", "sessions")
+		if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+			t.Fatalf("Could not create sessions directory: %v", err)
+		}
+
+		// Create session for different workDir
+		otherSession := filepath.Join(sessionsDir, "other-session.json")
+		if err := os.WriteFile(otherSession, []byte(`{"workDir": "/other/path"}`), 0644); err != nil {
+			t.Fatalf("Could not create session file: %v", err)
+		}
+
+		result := findCodexSessionIDInDir(testWorkDir, filepath.Join(home, ".codex", "sessions"))
+		if result != "" {
+			t.Errorf("expected empty string for non-matching workDir, got %q", result)
+		}
+	})
+}
+
+// TestFindGeminiSessionID tests the Gemini session discovery function.
+func TestFindGeminiSessionID(t *testing.T) {
+	// Create a unique test work directory
+	testWorkDir := t.TempDir()
+
+	t.Run("returns empty for non-existent tmp directory", func(t *testing.T) {
+		home := t.TempDir()
+		result := findGeminiSessionIDInDir(testWorkDir, filepath.Join(home, ".gemini", "tmp"))
+		if result != "" {
+			t.Errorf("expected empty string for non-existent directory, got %q", result)
+		}
+	})
+
+	t.Run("finds session in chats subdirectory", func(t *testing.T) {
+		home := t.TempDir()
+		// Create the Gemini tmp/chats directory structure
+		geminiChatsDir := filepath.Join(home, ".gemini", "tmp", "project-hash", "chats")
+		if err := os.MkdirAll(geminiChatsDir, 0755); err != nil {
+			t.Fatalf("Could not create chats directory: %v", err)
+		}
+
+		// Create a session file that contains the workDir
+		sessionFile := filepath.Join(geminiChatsDir, "gemini-session-abc.json")
+		sessionContent := `{"workDir": "` + testWorkDir + `", "data": "test"}`
+		if err := os.WriteFile(sessionFile, []byte(sessionContent), 0644); err != nil {
+			t.Fatalf("Could not create session file: %v", err)
+		}
+
+		result := findGeminiSessionIDInDir(testWorkDir, filepath.Join(home, ".gemini", "tmp"))
+		if result != "gemini-session-abc" {
+			t.Errorf("expected 'gemini-session-abc', got %q", result)
+		}
+	})
+
+	t.Run("ignores files not in chats directory", func(t *testing.T) {
+		home := t.TempDir()
+		// Create the Gemini tmp directory with a file NOT in chats
+		geminiTmpDir := filepath.Join(home, ".gemini", "tmp", "project-hash")
+		if err := os.MkdirAll(geminiTmpDir, 0755); err != nil {
+			t.Fatalf("Could not create tmp directory: %v", err)
+		}
+
+		// Create a session file NOT in chats subdirectory
+		sessionFile := filepath.Join(geminiTmpDir, "not-in-chats.json")
+		sessionContent := `{"workDir": "` + testWorkDir + `", "data": "test"}`
+		if err := os.WriteFile(sessionFile, []byte(sessionContent), 0644); err != nil {
+			t.Fatalf("Could not create session file: %v", err)
+		}
+
+		result := findGeminiSessionIDInDir(testWorkDir, filepath.Join(home, ".gemini", "tmp"))
+		if result != "" {
+			t.Errorf("expected empty string for file not in chats directory, got %q", result)
+		}
+	})
+
+	t.Run("returns most recent matching session", func(t *testing.T) {
+		home := t.TempDir()
+		geminiChatsDir := filepath.Join(home, ".gemini", "tmp", "project-hash2", "chats")
+		if err := os.MkdirAll(geminiChatsDir, 0755); err != nil {
+			t.Fatalf("Could not create chats directory: %v", err)
+		}
+
+		// Create older session
+		olderSession := filepath.Join(geminiChatsDir, "older-gemini.json")
+		if err := os.WriteFile(olderSession, []byte(`{"workDir": "`+testWorkDir+`"}`), 0644); err != nil {
+			t.Fatalf("Could not create session file: %v", err)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+
+		// Create newer session
+		newerSession := filepath.Join(geminiChatsDir, "newer-gemini.json")
+		if err := os.WriteFile(newerSession, []byte(`{"workDir": "`+testWorkDir+`"}`), 0644); err != nil {
+			t.Fatalf("Could not create session file: %v", err)
+		}
+
+		result := findGeminiSessionIDInDir(testWorkDir, filepath.Join(home, ".gemini", "tmp"))
+		if result != "newer-gemini" {
+			t.Errorf("expected 'newer-gemini' (most recent), got %q", result)
+		}
+	})
+}
+
+// TestBuildCommandWithSessionResume tests that BuildCommand correctly
+// includes the --resume flag when a session ID is provided.
+func TestBuildCommandWithSessionResume(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{}
+	exec := New(database, cfg)
+
+	// Clear env vars
+	os.Unsetenv("WORKTREE_DANGEROUS_MODE")
+
+	task := &db.Task{
+		ID:            1,
+		DangerousMode: false,
+		Port:          8080,
+		WorktreePath:  "/tmp/test-worktree",
+	}
+
+	tests := []struct {
+		name         string
+		executorName string
+		sessionID    string
+		wantContains string
+	}{
+		{
+			name:         "Claude with session ID",
+			executorName: db.ExecutorClaude,
+			sessionID:    "abc123-session-id",
+			wantContains: "--resume abc123-session-id",
+		},
+		{
+			name:         "Claude without session ID",
+			executorName: db.ExecutorClaude,
+			sessionID:    "",
+			wantContains: "",
+		},
+		{
+			name:         "Codex with session ID",
+			executorName: db.ExecutorCodex,
+			sessionID:    "codex-session-456",
+			wantContains: "--resume codex-session-456",
+		},
+		{
+			name:         "Gemini with session ID",
+			executorName: db.ExecutorGemini,
+			sessionID:    "gemini-session-789",
+			wantContains: "--resume gemini-session-789",
+		},
+		{
+			name:         "Grok with session ID",
+			executorName: db.ExecutorGrok,
+			sessionID:    "grok-session-012",
+			wantContains: "--resume grok-session-012",
+		},
+		{
+			name:         "Cursor with session ID",
+			executorName: db.ExecutorCursor,
+			sessionID:    "cursor-session-345",
+			wantContains: "--resume cursor-session-345",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := exec.executorFactory.Get(tt.executorName)
+			cmd := executor.BuildCommand(task, tt.sessionID, "")
+
+			if tt.wantContains != "" {
+				if !strings.Contains(cmd, tt.wantContains) {
+					t.Errorf("BuildCommand() = %q, should contain %q", cmd, tt.wantContains)
+				}
+			} else {
+				if strings.Contains(cmd, "--resume") {
+					t.Errorf("BuildCommand() = %q, should NOT contain --resume when no session ID", cmd)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildCommandWithDangerousAndResume tests that both dangerous mode flag
+// and resume flag are included when both are applicable.
+func TestBuildCommandWithDangerousAndResume(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{}
+	exec := New(database, cfg)
+
+	// Clear env vars
+	os.Unsetenv("WORKTREE_DANGEROUS_MODE")
+
+	task := &db.Task{
+		ID:            1,
+		DangerousMode: true,
+		Port:          8080,
+		WorktreePath:  "/tmp/test-worktree",
+	}
+
+	tests := []struct {
+		executorName string
+		dangerousArg string
+	}{
+		{db.ExecutorClaude, "--dangerously-skip-permissions"},
+		{db.ExecutorCodex, "--dangerously-bypass-approvals-and-sandbox"},
+		{db.ExecutorGemini, "--dangerously-allow-run"},
+		{db.ExecutorGrok, "--always-approve"},
+		{db.ExecutorCursor, "--force"},
+	}
+
+	sessionID := "test-session-combined"
+
+	for _, tt := range tests {
+		t.Run(tt.executorName, func(t *testing.T) {
+			executor := exec.executorFactory.Get(tt.executorName)
+			cmd := executor.BuildCommand(task, sessionID, "")
+
+			// Should contain both flags
+			if !strings.Contains(cmd, tt.dangerousArg) {
+				t.Errorf("BuildCommand() = %q, should contain dangerous flag %q", cmd, tt.dangerousArg)
+			}
+			if !strings.Contains(cmd, "--resume "+sessionID) {
+				t.Errorf("BuildCommand() = %q, should contain --resume %s", cmd, sessionID)
+			}
+		})
+	}
+}
+
+// TestOpenClawDangerousModeNotSupported tests that OpenClaw correctly reports
+// it doesn't support dangerous mode and ResumeDangerous returns false.
+func TestOpenClawDangerousModeNotSupported(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	// Create the test project first
+	if err := database.CreateProject(&db.Project{Name: "test", Path: "/tmp/test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{}
+	exec := New(database, cfg)
+
+	executor := exec.executorFactory.Get(db.ExecutorOpenClaw)
+
+	t.Run("SupportsDangerousMode returns false", func(t *testing.T) {
+		if executor.SupportsDangerousMode() {
+			t.Error("OpenClaw should not support dangerous mode")
+		}
+	})
+
+	t.Run("BuildCommand does not include dangerous flags", func(t *testing.T) {
+		task := &db.Task{
+			ID:            1,
+			DangerousMode: true, // Even when enabled on task
+			Port:          8080,
+			WorktreePath:  "/tmp/test-worktree",
+		}
+
+		cmd := executor.BuildCommand(task, "", "")
+
+		// Should NOT contain any dangerous flag
+		dangerousFlags := []string{
+			"--dangerously-skip-permissions",
+			"--dangerously-bypass-approvals-and-sandbox",
+			"--dangerously-allow-run",
+		}
+		for _, flag := range dangerousFlags {
+			if strings.Contains(cmd, flag) {
+				t.Errorf("OpenClaw BuildCommand() = %q, should NOT contain %q", cmd, flag)
+			}
+		}
+	})
+
+	t.Run("ResumeDangerous returns false", func(t *testing.T) {
+		task := &db.Task{
+			ID:      1,
+			Project: "test",
+		}
+		if err := database.CreateTask(task); err != nil {
+			t.Fatal(err)
+		}
+
+		result := executor.ResumeDangerous(task, "/tmp/test-worktree")
+		if result {
+			t.Error("OpenClaw ResumeDangerous should return false")
+		}
+	})
+}
+
+// TestOpenCodeDangerousModeNotSupported tests that OpenCode correctly reports
+// it doesn't support dangerous mode and ResumeDangerous returns false.
+func TestOpenCodeDangerousModeNotSupported(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	// Create the test project first
+	if err := database.CreateProject(&db.Project{Name: "test", Path: "/tmp/test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{}
+	exec := New(database, cfg)
+
+	executor := exec.executorFactory.Get(db.ExecutorOpenCode)
+
+	t.Run("SupportsDangerousMode returns false", func(t *testing.T) {
+		if executor.SupportsDangerousMode() {
+			t.Error("OpenCode should not support dangerous mode")
+		}
+	})
+
+	t.Run("SupportsSessionResume returns false", func(t *testing.T) {
+		if executor.SupportsSessionResume() {
+			t.Error("OpenCode should not support session resume")
+		}
+	})
+
+	t.Run("BuildCommand does not include dangerous flags", func(t *testing.T) {
+		task := &db.Task{
+			ID:            1,
+			DangerousMode: true, // Even when enabled on task
+			Port:          8080,
+			WorktreePath:  "/tmp/test-worktree",
+		}
+
+		cmd := executor.BuildCommand(task, "", "")
+
+		// Should NOT contain any dangerous flag
+		dangerousFlags := []string{
+			"--dangerously-skip-permissions",
+			"--dangerously-bypass-approvals-and-sandbox",
+			"--dangerously-allow-run",
+		}
+		for _, flag := range dangerousFlags {
+			if strings.Contains(cmd, flag) {
+				t.Errorf("OpenCode BuildCommand() = %q, should NOT contain %q", cmd, flag)
+			}
+		}
+	})
+
+	t.Run("ResumeDangerous returns false", func(t *testing.T) {
+		task := &db.Task{
+			ID:      1,
+			Project: "test",
+		}
+		if err := database.CreateTask(task); err != nil {
+			t.Fatal(err)
+		}
+
+		result := executor.ResumeDangerous(task, "/tmp/test-worktree")
+		if result {
+			t.Error("OpenCode ResumeDangerous should return false")
+		}
+	})
+}
+
+// TestCyclePermissionModeRouting verifies the decision flow behind the UI's "!"
+// key: cycling advances the mode (default -> accept-edits -> auto -> dangerous ->
+// default) and ResumeWithMode routes the dangerous target to ResumeDangerous and
+// every other target to ResumeSafe (which now honors the task's non-dangerous mode).
+func TestCyclePermissionModeRouting(t *testing.T) {
+	tests := []struct {
+		from             string
+		wantNext         string
+		expectDangerCall bool // ResumeWithMode routes dangerous -> ResumeDangerous, else ResumeSafe
+	}{
+		{db.PermissionModeDefault, db.PermissionModeAcceptEdits, false},
+		{db.PermissionModeAcceptEdits, db.PermissionModeAuto, false},
+		{db.PermissionModeAuto, db.PermissionModeDangerous, true},
+		{db.PermissionModeDangerous, db.PermissionModeDefault, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.from, func(t *testing.T) {
+			next := db.NextPermissionMode(tt.from)
+			if next != tt.wantNext {
+				t.Fatalf("NextPermissionMode(%q) = %q, want %q", tt.from, next, tt.wantNext)
+			}
+			gotDanger := next == db.PermissionModeDangerous
+			if gotDanger != tt.expectDangerCall {
+				t.Errorf("from %q -> %q: routes to ResumeDangerous = %v, want %v", tt.from, next, gotDanger, tt.expectDangerCall)
+			}
+		})
+	}
+}
+
+// TestResumeDangerousUpdatesDatabase verifies that the executor's ResumeDangerous
+// implementation correctly sets DangerousMode=true in the database.
+// This test uses the database layer directly since the full Resume flow requires tmux.
+func TestResumeDangerousUpdatesDatabase(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	// Create a test task
+	task := &db.Task{
+		Title:         "Test task",
+		Status:        db.StatusProcessing,
+		DangerousMode: false, // starts in safe mode
+	}
+	if err := database.CreateTask(task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify initial state
+	retrieved, err := database.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retrieved.DangerousMode != false {
+		t.Error("task should start in safe mode (DangerousMode=false)")
+	}
+
+	// Simulate what ResumeDangerous does - update the database
+	if err := database.UpdateTaskDangerousMode(task.ID, true); err != nil {
+		t.Fatalf("UpdateTaskDangerousMode failed: %v", err)
+	}
+
+	// Verify database was updated
+	retrieved, err = database.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retrieved.DangerousMode {
+		t.Error("task should be in dangerous mode after toggle (DangerousMode=true)")
+	}
+}
+
+// TestResumeSafeUpdatesDatabase verifies that the executor's ResumeSafe
+// implementation correctly sets DangerousMode=false in the database.
+func TestResumeSafeUpdatesDatabase(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	// Create a test task that starts in dangerous mode
+	task := &db.Task{
+		Title:         "Test task",
+		Status:        db.StatusProcessing,
+		DangerousMode: true, // starts in dangerous mode
+	}
+	if err := database.CreateTask(task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set it to dangerous mode explicitly to ensure we're testing the toggle
+	if err := database.UpdateTaskDangerousMode(task.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify initial state
+	retrieved, err := database.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retrieved.DangerousMode {
+		t.Error("task should start in dangerous mode (DangerousMode=true)")
+	}
+
+	// Simulate what ResumeSafe does - update the database
+	if err := database.UpdateTaskDangerousMode(task.ID, false); err != nil {
+		t.Fatalf("UpdateTaskDangerousMode failed: %v", err)
+	}
+
+	// Verify database was updated
+	retrieved, err = database.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retrieved.DangerousMode {
+		t.Error("task should be in safe mode after toggle (DangerousMode=false)")
+	}
+}
+
+// TestToggleDangerousModeCycle tests a complete toggle cycle:
+// safe -> dangerous -> safe
+func TestToggleDangerousModeCycle(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	// Create a test task starting in safe mode
+	task := &db.Task{
+		Title:         "Test task",
+		Status:        db.StatusProcessing,
+		DangerousMode: false,
+	}
+	if err := database.CreateTask(task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial state: safe mode
+	retrieved, _ := database.GetTask(task.ID)
+	if retrieved.DangerousMode {
+		t.Fatal("task should start in safe mode")
+	}
+
+	// First toggle: safe -> dangerous
+	// (In real code, this is done by exec.ResumeDangerous which calls UpdateTaskDangerousMode)
+	if err := database.UpdateTaskDangerousMode(task.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	retrieved, _ = database.GetTask(task.ID)
+	if !retrieved.DangerousMode {
+		t.Error("first toggle should switch to dangerous mode")
+	}
+
+	// Second toggle: dangerous -> safe
+	// (In real code, this is done by exec.ResumeSafe which calls UpdateTaskDangerousMode)
+	if err := database.UpdateTaskDangerousMode(task.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	retrieved, _ = database.GetTask(task.ID)
+	if retrieved.DangerousMode {
+		t.Error("second toggle should switch back to safe mode")
+	}
+}
+
+// TestBuildCommandIncludesEnvironmentVariables tests that BuildCommand
+// includes the necessary WORKTREE_* environment variables.
+func TestBuildCommandIncludesEnvironmentVariables(t *testing.T) {
+	// Create temp database
+	tmpFile, err := os.CreateTemp("", "test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	database, err := db.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{}
+	exec := New(database, cfg)
+
+	task := &db.Task{
+		ID:           42,
+		Port:         9000,
+		WorktreePath: "/home/user/projects/myapp/.task-worktrees/42-fix-bug",
+	}
+
+	executors := []string{db.ExecutorClaude, db.ExecutorCodex, db.ExecutorGemini, db.ExecutorGrok, db.ExecutorCursor, db.ExecutorOpenClaw, db.ExecutorOpenCode}
+
+	for _, name := range executors {
+		t.Run(name, func(t *testing.T) {
+			executor := exec.executorFactory.Get(name)
+			cmd := executor.BuildCommand(task, "", "")
+
+			// Check for task ID
+			if !strings.Contains(cmd, "WORKTREE_TASK_ID=42") {
+				t.Errorf("BuildCommand() should contain WORKTREE_TASK_ID=42, got %q", cmd)
+			}
+
+			// Check for port
+			if !strings.Contains(cmd, "WORKTREE_PORT=9000") {
+				t.Errorf("BuildCommand() should contain WORKTREE_PORT=9000, got %q", cmd)
+			}
+
+			// Check for worktree path
+			if !strings.Contains(cmd, "WORKTREE_PATH=") {
+				t.Errorf("BuildCommand() should contain WORKTREE_PATH=, got %q", cmd)
+			}
+		})
+	}
+}

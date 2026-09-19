@@ -262,7 +262,13 @@ func (c *composer) statusLine() string {
 	if c.workingFor != "" {
 		label += " · " + c.workingFor
 	}
-	return lipgloss.NewStyle().Foreground(ColorInProgress).Render(label)
+	running := lipgloss.NewStyle().Foreground(ColorInProgress).Render(label)
+
+	// The app puts a stop control on the composer while a turn is in flight.
+	// A terminal has no button, so the key is named where the button would be.
+	stop := lipgloss.NewStyle().Foreground(ColorError).Bold(true).Render("ctrl+s") +
+		lipgloss.NewStyle().Foreground(ColorMuted).Render(" stop")
+	return running + "   " + stop
 }
 
 func (c *composer) update(msg tea.Msg) (tea.Cmd, bool) {

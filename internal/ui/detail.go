@@ -2808,23 +2808,14 @@ func (m *DetailModel) View() string {
 		}
 	}
 
-	// Writing a message takes focus away from what is being read, as it does in
-	// the app: the conversation dims so the eye goes to the box. renderHelp is
-	// left alone — it has its own branch for the composer and must stay bright.
+	// The conversation is not dimmed while composing. Focus is shown by the
+	// composer's own border instead: dimming the transcript greys every word
+	// the message is being written about, which is the text most worth reading
+	// at that moment.
 	composing := m.ComposerFocused()
-	wasFocused := m.focused
-	if composing {
-		m.focused = false
-	}
 
 	header := m.renderHeader()
-	if composing {
-		m.focused = wasFocused
-	}
 	help := m.renderHelp()
-	if composing {
-		m.focused = false
-	}
 
 	sig := m.viewSignature(header, help)
 	if composing {
@@ -2933,7 +2924,6 @@ func (m *DetailModel) View() string {
 
 	out := lipgloss.JoinVertical(lipgloss.Left, viewParts...)
 
-	m.focused = wasFocused
 	m.cachedView = out
 	m.cachedViewSig = sig
 	m.cachedViewOK = true
@@ -3649,6 +3639,7 @@ func (m *DetailModel) renderHelpRow(composing bool) string {
 			keyStyle.Render("esc") + " " + descStyle.Render("shortcuts"),
 			keyStyle.Render("enter") + " " + descStyle.Render("send"),
 			keyStyle.Render("shift+enter") + " " + descStyle.Render("newline"),
+			keyStyle.Render("ctrl+s") + " " + descStyle.Render("stop"),
 			keyStyle.Render(arrowPairLabel()) + " " + descStyle.Render("scroll"),
 			keyStyle.Render("shift+"+arrowPairLabel()) + " " + descStyle.Render("prev/next message"),
 		}
@@ -3689,13 +3680,22 @@ func (m *DetailModel) renderHelpRow(composing bool) string {
 
 	// Primary keys are the handful of high-frequency actions kept visible when
 	// the row is collapsed; everything else is tucked behind '?'.
-	keys := []helpKey{
-		{arrowPairLabel(), "scroll", false, true},
-		{"shift+" + arrowPairLabel(), "prev/next message", false, false},
-		{"ctrl+l", "jump to latest", false, false},
-		{"ctrl+g", "quote into message", false, false},
-		{"ctrl+t", "mouse on/off (for select & copy)", false, false},
-		{"ctrl+" + arrowPairLabel(), "prev/next task", !hasNavigation, false},
+	// The arrows only scroll where a thread is being read; with the composer off
+	// they still change task, and the footer has to say whichever is true.
+	arrowRow := helpKey{arrowPairLabel(), "prev/next task", !hasNavigation, true}
+	if ComposerEnabled {
+		arrowRow = helpKey{arrowPairLabel(), "scroll", false, true}
+	}
+
+	keys := []helpKey{arrowRow}
+	if ComposerEnabled {
+		keys = append(keys,
+			helpKey{"shift+" + arrowPairLabel(), "prev/next message", false, false},
+			helpKey{"ctrl+l", "jump to latest", false, false},
+			helpKey{"ctrl+g", "quote into message", false, false},
+			helpKey{"ctrl+t", "mouse on/off (for select & copy)", false, false},
+			helpKey{"ctrl+" + arrowPairLabel(), "prev/next task", !hasNavigation, false},
+		)
 	}
 
 	// Show scroll hint when content is scrollable

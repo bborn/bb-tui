@@ -621,6 +621,13 @@ func (m *FormModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// values so the rest of the form sees the keys it already handles.
 	msg = translateModernKey(msg)
 
+	// Shift+Enter arrives as alt+enter so the thread composer can tell "send"
+	// from "newline". A form has no send key, so here it is simply a newline
+	// and the alt is dropped before anything matches on it.
+	if key, ok := msg.(tea.KeyMsg); ok && key.Type == tea.KeyEnter && key.Alt {
+		msg = tea.KeyMsg{Type: tea.KeyEnter}
+	}
+
 	switch msg := msg.(type) {
 	// Handle autocomplete debounce tick - fire the LLM request
 	case autocompleteTickMsg:
