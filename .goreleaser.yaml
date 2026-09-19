@@ -35,15 +35,6 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: https://github.com/bborn/bb-tui
     description: A terminal UI for bb
-    # Downloaded binaries are quarantined by Gatekeeper; clearing the attribute
-    # is what lets a cask-installed binary run without a right-click dance.
-    hooks:
-      post:
-        install: |
-          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
-            system_command "/usr/bin/xattr",
-                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/bb-tui"]
-          end
 
 changelog:
   use: github

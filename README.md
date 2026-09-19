@@ -18,6 +18,10 @@ each, with a composer underneath.
 
 ![Skill completion](docs/screenshots/skills.png)
 
+`v` swaps the board for a list, grouped and sorted however you arrange it.
+
+![The list view](docs/screenshots/list.png)
+
 ## Install
 
 With Go:

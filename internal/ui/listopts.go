@@ -228,19 +228,21 @@ func (o ListOptions) sectionTitle(key string) string {
 	return key
 }
 
-// statusLabel is the human name for a status.
+// statusLabel is the human name for a status. The list groups by the same
+// statuses the board columns do, so it takes their names: a reader who has just
+// pressed v to swap views should not find the groups renamed.
 func statusLabel(status string) string {
 	switch status {
 	case db.StatusProcessing:
-		return "Running"
+		return ColumnTitles[1]
 	case db.StatusBlocked:
-		return "Blocked"
+		return ColumnTitles[2]
 	case db.StatusQueued:
-		return "In progress"
+		return ColumnTitles[1]
 	case db.StatusBacklog:
-		return "Backlog"
+		return ColumnTitles[0]
 	case db.StatusDone:
-		return "Done"
+		return ColumnTitles[3]
 	case db.StatusArchived:
 		return "Archived"
 	}

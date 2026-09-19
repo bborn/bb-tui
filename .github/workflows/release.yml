@@ -17,10 +17,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+      # Without a tap token the cask cannot be pushed, and GoReleaser fails the
+      # whole release over it — binaries included. Skip that one step instead.
+      - name: Choose release steps
+        id: steps
+        run: |
+          if [ -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
+            echo "args=release --clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=release --clean --skip=homebrew_casks" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: '~> v2'
-          args: release --clean
+          args: ${{ steps.steps.outputs.args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # A token that can push to bborn/homebrew-tap. Without it the release
