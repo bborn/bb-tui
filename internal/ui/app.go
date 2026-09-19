@@ -130,6 +130,12 @@ type KeyMap struct {
 
 // ShortHelp returns key bindings to show in the mini help.
 func (k KeyMap) ShortHelp() []key.Binding {
+	// "execute" is TaskYou's: it queues a task and then runs it. A bb thread
+	// runs when it is created, so the key is not offered and must not be
+	// advertised either.
+	if ComposerEnabled {
+		return []key.Binding{k.Left, k.Right, k.Up, k.Down, k.Enter, k.New, k.Approvals, k.Filter, k.ToggleListView, k.SavedViews, k.CommandPalette, k.Help, k.Quit}
+	}
 	return []key.Binding{k.Left, k.Right, k.Up, k.Down, k.Enter, k.New, k.Queue, k.Filter, k.ToggleListView, k.SavedViews, k.CommandPalette, k.Help, k.Quit}
 }
 
@@ -2094,8 +2100,10 @@ func renderBanner(text string, bg, fg lipgloss.Color, width int) string {
 func (m *AppModel) viewDashboard() string {
 	var headerParts []string
 
-	// Show warning banner if no executors are available
-	if len(m.availableExecutors) == 0 {
+	// Show warning banner if no executors are available. bb runs the agent
+	// itself, so a locally installed CLI is not a prerequisite and its absence
+	// is not worth a banner.
+	if len(m.availableExecutors) == 0 && !ComposerEnabled {
 		headerParts = append(headerParts, renderBanner(
 			IconBlocked()+" No AI executor installed. See: https://code.claude.com/docs/en/overview",
 			bannerWarnBg, bannerWarnFg, m.width))
@@ -2116,7 +2124,9 @@ func (m *AppModel) viewDashboard() string {
 	}
 
 	// One-time plugins nudge, styled like the upgrade banner it sits beside
-	if m.showPluginNudge {
+	// The plugin nudge advertises TaskYou's own plugin catalogue, which is not
+	// where a bb user installs anything.
+	if m.showPluginNudge && !ComposerEnabled {
 		nudgeStyle := lipgloss.NewStyle().
 			Background(lipgloss.Color("#61AFEF")). // Blue background
 			Foreground(lipgloss.Color("#FFFFFF")).
