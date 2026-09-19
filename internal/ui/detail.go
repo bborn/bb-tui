@@ -1,0 +1,3874 @@
+package ui
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io/fs"
+	"os"
+	osExec "os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/bborn/bb-tui/internal/config"
+	"github.com/bborn/bb-tui/internal/db"
+	"github.com/bborn/bb-tui/internal/executor"
+	"github.com/bborn/bb-tui/internal/executorlock"
+	"github.com/bborn/bb-tui/internal/github"
+	"github.com/bborn/bb-tui/internal/pipeline"
+	"github.com/bborn/bb-tui/internal/qmd"
+	"github.com/bborn/bb-tui/internal/tasksummary"
+)
+
+// shouldSkipAutoExecutor returns true if the task should NOT automatically
+// start the executor when viewed in the TUI. Tasks in backlog status are
+// explicitly not ready for execution, and done/archived tasks are finished.
+func shouldSkipAutoExecutor(task *db.Task) bool {
+	switch task.Status {
+	case db.StatusBacklog, db.StatusDone, db.StatusArchived:
+		return true
+	default:
+		return false
+	}
+}
+
+// paneAction describes what the detail view should do for a task that has no
+// existing tmux window when it is opened.
+type paneAction int
+
+const (
+	// paneActionStartExecutor: start a fresh executor session, then join its panes.
+	paneActionStartExecutor paneAction = iota
+	// paneActionSkip: don't start anything (backlog/done/archived tasks).
+	paneActionSkip
+	// paneActionWaitForExecutor: a daemon-owned task (queued/processing) whose
+	// window doesn't exist yet — the daemon's executor will create it shortly;
+	// keep polling for it instead of starting our own.
+	paneActionWaitForExecutor
+	// paneActionWorktreeMissing: the task records a worktree that is no longer on
+	// disk. Nothing may be started (tmux would run the agent in $HOME) and nothing
+	// may be joined (no pane could ever pass the worktree ownership check). The
+	// view says so and offers to recreate the worktree.
+	paneActionWorktreeMissing
+)
+
+// pendingPaneAction decides what to do when a task has no existing tmux window.
+// Extracted as a pure function (no tmux I/O) so the open-path decision tree can
+// be unit-tested without a running tmux server.
+// worktreeMissing says the task's recorded worktree is gone from disk; see
+// taskWorktreeMissing for how that is established.
+func pendingPaneAction(task *db.Task, worktreeMissing bool) paneAction {
+	if shouldSkipAutoExecutor(task) {
+		return paneActionSkip
+	}
+	// Queued and processing tasks belong to the daemon's executor, which creates
+	// the window. If we reach here the window doesn't exist yet, meaning the daemon
+	// is still spinning it up. Starting our own executor now races the daemon and
+	// double-spawns — two Claude sessions in the same worktree with clobbered pane
+	// ids (the "executors mixed up" bug). Wait and let ensureTmuxPanesJoined join
+	// the daemon's panes once they appear.
+	//
+	// This must hold regardless of WorktreePath: the worktree is created early in
+	// the daemon's spin-up, so a queued/processing task frequently already has one
+	// while its executor window is still pending. Gating the wait on
+	// WorktreePath == "" (as this once did) let exactly that window slip through to
+	// the start path. A daemon that never creates the window (e.g. it died, leaving
+	// the task stuck "processing") is handled downstream by a bounded wait that
+	// falls back to offering "Start session".
+	if task.Status == db.StatusQueued || task.Status == db.StatusProcessing {
+		return paneActionWaitForExecutor
+	}
+	// The worktree the task records was reaped while the row kept pointing at it.
+	// Starting here is what looped: tmux's `new-window -c <gone>` does not fail,
+	// it starts the agent in $HOME, and the pane it creates can never satisfy the
+	// "is this pane in the task's worktree?" check that follows — so setup ran
+	// again, and again. Stop instead, and let the user recreate the worktree.
+	if worktreeMissing {
+		return paneActionWorktreeMissing
+	}
+	return paneActionStartExecutor
+}
+
+// taskWorktreeMissing returns the task's recorded worktree path when that path
+// is no longer on disk (or is no longer a directory), and "" otherwise.
+//
+// Only a definite "not there" counts: a stat failing for any other reason
+// (permissions, a slow network mount) leaves the task startable, so a transient
+// error never wedges a healthy task. A remotely placed task has no local
+// worktree by design and is never reported missing.
+func taskWorktreeMissing(task *db.Task) (string, bool) {
+	if task == nil || task.WorktreePath == "" || task.PlacementTarget != "" {
+		return "", false
+	}
+	info, err := os.Stat(task.WorktreePath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return task.WorktreePath, true
+		}
+		return "", false
+	}
+	if !info.IsDir() {
+		return task.WorktreePath, true
+	}
+	return "", false
+}
+
+// worktreeMissingMessage is the user-visible explanation, and the recovery, for
+// a task whose worktree is gone. It names the key that rebuilds it so the state
+// is a dead end only until the user presses one key.
+func worktreeMissingMessage(path string) string {
+	return fmt.Sprintf("Worktree missing: %s — nothing started. Press W to recreate it.", path)
+}
+
+// spawnLoopMessage explains a tripped spawn breaker (see executor_spawn_guard.go).
+func spawnLoopMessage(executorName string) string {
+	return fmt.Sprintf("Stopped starting %s: %d launches in %s never produced a usable pane. Press W to rebuild the worktree, or reopen this task to try again later.",
+		executorName, maxExecutorSpawns, executorSpawnWindow)
+}
+
+// adoptRejectedMessage explains a refused pane adopt. The refusal itself is
+// correct (the pane is not in this task's worktree); what used to be wrong was
+// falling straight back into pane setup, which started yet another executor.
+func adoptRejectedMessage(executorName string) string {
+	return fmt.Sprintf("Refused to attach: the %s pane is not in this task's worktree. Nothing was started. Press W to rebuild the worktree, or reopen this task to retry.",
+		executorName)
+}
+
+// waitForExecutorTimeout bounds how long the detail view waits for the daemon to
+// create a daemon-owned task's executor window before giving up and starting one
+// itself. The daemon normally creates it within seconds; if it never does (e.g.
+// it died, leaving the task stuck "processing"), we fall back to the start path
+// so the view isn't wedged forever. The fallback is race-safe: it starts through
+// EnsureTaskWindow's spawn lock, which re-checks for an existing window.
+const waitForExecutorTimeout = 60 * time.Second
+
+// shouldFallBackToStart reports whether a view that has been passively waiting for
+// the daemon's executor (paneActionWaitForExecutor) should give up and start one
+// itself. It gives up only once the timeout has elapsed with no panes joined.
+//
+// hasWorktree gates the whole fallback. The wait times out for two very
+// different reasons, and only one of them is safe to recover from here:
+//
+//   - The daemon provisioned the task (worktree exists) but its window never
+//     appeared — it died mid-spin-up. Starting the session ourselves lands in
+//     that worktree, and is the recovery this fallback was written for.
+//   - The daemon never provisioned the task at all (no worktree). Starting it
+//     now has nowhere isolated to run: EnsureTaskWindow used to fall back to the
+//     primary clone, which is how a pipeline verify step ran 42 minutes in the
+//     main repo and — having no recorded worktree — stayed invisible to
+//     reconcileFinishedWorkflowSteps and never parked for merge review. Nothing
+//     here can fix an unprovisioned task, so keep waiting for the daemon.
+func shouldFallBackToStart(waitingForExecutor, panesJoined, hasWorktree bool, waited, timeout time.Duration) bool {
+	return waitingForExecutor && !panesJoined && hasWorktree && waited >= timeout
+}
+
+// liveExecutorInPaneCommands reports whether any of the given tmux pane
+// current-commands indicates a live executor process (Claude, Codex, Gemini, a
+// subprocess it spawned, etc.).
+//
+// While a detail view is closed, breakTmuxPanes joins the executor pane back into
+// its daemon window, so a healthy window holds the executor plus (optionally) a
+// shell. When an executor exits — e.g. a `claude --resume` that ran against the
+// wrong CLAUDE_CONFIG_DIR before the #577 fix — the window is left with only its
+// keep-alive `tail` placeholder and/or a plain shell. Such a window must be
+// rebuilt rather than rejoined, or the detail view rejoins a dead pane forever
+// ("lost executor pane") and never reruns BuildCommand. A command is therefore a
+// live executor unless it is blank, the `tail` placeholder, or a shell.
+func liveExecutorInPaneCommands(cmds []string) bool {
+	for _, c := range cmds {
+		c = strings.TrimSpace(c)
+		if c == "" || c == "tail" || isShellCommand(c) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// isShellCommand reports whether a tmux pane_current_command is an interactive
+// shell. Login shells report with a leading dash (e.g. "-zsh").
+func isShellCommand(cmd string) bool {
+	switch strings.TrimPrefix(cmd, "-") {
+	case "zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh":
+		return true
+	}
+	return false
+}
+
+// DetailModel represents the task detail view.
+type DetailModel struct {
+	messageAnchors []MessageAnchor
+	stickyBottom   bool
+	prompt         composer
+	hostHealth     db.HostHealth
+	paneWork       sync.WaitGroup
+	task           *db.Task
+	logs           []*db.TaskLog
+	database       *db.DB
+	executor       *executor.Executor
+	viewport       viewport.Model
+	width          int
+	height         int
+	ready          bool
+	prInfo         *github.PRInfo
+
+	// Task position in column (1-indexed)
+	positionInColumn int
+	totalInColumn    int
+
+	// helpExpanded controls the footer help row: collapsed shows only the
+	// high-frequency actions plus a '?' affordance; expanded reveals the rest.
+	helpExpanded bool
+
+	// Track joined tmux panes
+	claudePaneID    string // The Claude Code pane (middle-left)
+	workdirPaneID   string // The workdir shell pane (middle-right)
+	daemonSessionID string // The daemon session the Claude pane came from
+	tuiPaneID       string // The TUI/Details pane (top)
+	uiSessionName   string // The full UI session name (e.g., task-ui-12345)
+
+	// Cached tmux window target (set once on creation, cleared on kill)
+	cachedWindowTarget string
+
+	// Cached Claude process memory (updated on Refresh)
+	claudeMemoryMB int
+
+	// Initial pane dimensions (to detect user resizing)
+	initialDetailHeight int // percentage when panes were joined
+	initialShellWidth   int // percentage when panes were joined
+
+	// Focus state - true when the detail pane is the active tmux pane
+	focused bool
+
+	// Track if join-pane has failed (with cooldown to allow retries)
+	joinPaneFailedUntil time.Time
+
+	// The view of the task's daemon window (see detail_view.go): the UI pane
+	// running the nested client, and the grouped session it is attached to.
+	viewerPaneID string
+	viewSession  string
+
+	// Cached Glamour renderers (created once, reused)
+	glamourRendererFocused   *glamour.TermRenderer
+	glamourRendererUnfocused *glamour.TermRenderer
+	glamourWidth             int // Width the renderers were created for
+
+	// Content caching to avoid unnecessary re-renders
+	// Sibling steps of this task's workflow (empty for standalone tasks), loaded
+	// when the task changes rather than per-render so View() stays cheap.
+	workflowSteps []*db.Task
+
+	lastRenderedBody     string
+	lastRenderedSummary  string
+	lastRenderedLogHash  uint64
+	lastRenderedFocused  bool
+	lastRenderedWorkflow uint64
+	cachedContent        string
+
+	// View render cache. View() runs on every Bubble Tea update while the detail
+	// view is open (focus ticks, polls, pane events), but its pixels only change
+	// when an input does. Each call renders the cheap header/help, folds them and
+	// the viewport/scroll/theme state into a signature, and reuses the previously
+	// rendered string when the signature is unchanged — skipping the expensive
+	// viewport.View() + bordered box.Render() (~2ms, ~2.7MB) on idle frames.
+	cachedView    string
+	cachedViewSig uint64
+	cachedViewOK  bool
+
+	// viewportContentVersion bumps whenever the viewport content is (re)set, so the
+	// View render cache knows the body changed even though the viewport value itself
+	// is opaque. Mutated only through setViewportContent.
+	viewportContentVersion uint64
+
+	// Log count tracking for smarter refreshes
+	lastLogCount    int
+	logsLoading     bool // true while async log loading is in progress
+	refreshInFlight bool
+
+	// Memory check throttling (don't check every refresh)
+	lastMemoryCheck time.Time
+
+	// Shell process indicator, refreshed on a throttle in Refresh() rather than
+	// queried on every render. HasRunningShellProcess() shells out to tmux, so
+	// calling it from renderHeader() (every frame) meant a synchronous subprocess
+	// on the UI thread per paint. We cache the result and refresh it periodically.
+	hasRunningShellProc  bool
+	lastShellProcessPoll time.Time
+
+	// Pane join check throttling
+	lastPaneCheck      time.Time
+	paneHealthInFlight bool
+
+	// Async pane loading state
+	paneLoading      bool      // true while panes are being set up asynchronously
+	paneLoadingStart time.Time // when loading started (for spinner animation)
+	paneError        string    // user-visible error when panes fail to open
+	// paneNotice explains, without blaming anything, why there are no panes to
+	// show — today only "this task is running on another machine". It is styled
+	// as information, not as a failure, because nothing failed.
+	paneNotice string
+
+	// paneSetupHalted is the reason pane setup stopped deliberately and must NOT
+	// be retried automatically: a missing worktree, a refused pane adopt, or a
+	// tripped spawn breaker. It is the terminal state the respawn loop lacked —
+	// while it is set, the health poll stays quiet and no start path may run, so
+	// the view shows one clear explanation instead of starting another executor
+	// every ten seconds. Cleared by explicit user recovery (recreating the
+	// worktree) or by reopening the task.
+	paneSetupHalted string
+
+	// paneAdoptRejected is set by joinTmuxPanes when the candidate executor pane
+	// failed the worktree ownership check, so the caller can turn that refusal
+	// into a halt rather than looping back into setup.
+	paneAdoptRejected bool
+
+	// remotePaneID is the LOCAL pane holding an ssh client attached to a remotely
+	// placed task's tmux session. It is not a joined daemon pane and must never be
+	// broken back to one: nothing on this machine owns it, so it is created and
+	// killed outright. Empty for every local task.
+	remotePaneID      string
+	remoteShellPaneID string
+
+	// waitingForExecutor is true when we're passively waiting for the daemon's
+	// executor to create the tmux window (e.g. a freshly created+queued task with
+	// no worktree yet). In this mode we still show the loading spinner, but unlike
+	// active async setup (startPanesAsync/restartForExecutorSwitch) we want
+	// ensureTmuxPanesJoined to keep polling and join the panes as soon as they exist.
+	waitingForExecutor bool
+
+	// Focus executor pane after joining (e.g., when jumping from kanban)
+	focusExecutorOnJoin bool
+
+	// Shell pane visibility toggle
+	shellPaneHidden bool // true when shell pane is collapsed to daemon
+
+	// Server detection for task port
+	serverListening bool      // true when a server is listening on the task's port
+	lastServerCheck time.Time // throttle server port checks
+
+	// Related tasks from QMD semantic search
+	relatedTasks        []qmd.RelatedTask // cached related tasks
+	relatedTasksLoading bool              // true while loading related tasks
+	relatedTasksLoaded  bool              // true once loaded (even if empty)
+	lastRelatedSearch   string            // cache key for related task search
+}
+
+// Message types for async pane loading
+type panesJoinedMsg struct {
+	claudePaneID    string
+	workdirPaneID   string
+	daemonSessionID string
+	windowTarget    string
+	viewerPaneID    string
+	viewSession     string
+	userMessage     string
+	err             error
+}
+
+// paneWaitForExecutorMsg is returned by setupPanesAsync when a freshly queued
+// task has no worktree (and thus no window) yet. It tells the detail view to keep
+// showing the loading spinner and let ensureTmuxPanesJoined poll the executor's
+// panes in once the daemon creates them.
+type paneWaitForExecutorMsg struct{}
+
+// paneSetupHaltedMsg reports that pane setup stopped on purpose and will not be
+// retried on its own. reason is shown to the user verbatim and explains the
+// recovery; nothing about it should read as "trying again shortly", because
+// trying again shortly is the bug it exists to prevent.
+type paneSetupHaltedMsg struct{ reason string }
+
+// paneRemoteMsg is returned by the pane setup when the task was placed on
+// another machine. The detail view's pane machinery is entirely local — there is
+// no pane here to join, and starting one would be a second agent on a second
+// machine — so the view says where the task is and how to reach it instead.
+type paneRemoteMsg struct{ message string }
+
+// paneRemoteAttachedMsg is returned when a remotely placed task's live tmux
+// session was rendered into a LOCAL pane. paneID is that pane; notice is the
+// line shown beside it, which documents the nested-tmux prefix.
+type paneRemoteAttachedMsg struct {
+	paneID      string
+	notice      string
+	shellHidden bool
+}
+
+// logsLoadedMsg is sent when async log loading completes.
+type logsLoadedMsg struct {
+	taskID   int64
+	logs     []*db.TaskLog
+	logCount int
+}
+
+type spinnerTickMsg struct{}
+
+// relatedTasksMsg is sent when related tasks are loaded from QMD
+type relatedTasksMsg struct {
+	taskID  int64
+	results []qmd.RelatedTask
+	err     error
+}
+
+// loadRelatedTasks fetches related tasks from QMD in the background
+func loadRelatedTasks(taskID int64, query string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		results, err := qmd.DefaultClient.FindRelatedTasks(ctx, query, 5)
+		if err != nil {
+			return relatedTasksMsg{taskID: taskID, err: err}
+		}
+
+		// Filter out the current task from results
+		filtered := make([]qmd.RelatedTask, 0, len(results))
+		for _, r := range results {
+			if r.TaskID != taskID {
+				filtered = append(filtered, r)
+			}
+		}
+
+		return relatedTasksMsg{taskID: taskID, results: filtered}
+	}
+}
+
+// Spinner frames for loading animation
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func (m *DetailModel) executorDisplayName() string {
+	// Use the task's executor field if available (each task can have a different executor)
+	if m.task != nil && m.task.Executor != "" {
+		switch m.task.Executor {
+		case db.ExecutorCodex:
+			return "Codex"
+		case db.ExecutorClaude:
+			return "Claude"
+		case db.ExecutorGemini:
+			return "Gemini"
+		case db.ExecutorGrok:
+			return "Grok"
+		case db.ExecutorCursor:
+			return "Cursor"
+		case db.ExecutorOpenClaw:
+			return "OpenClaw"
+		default:
+			// Unknown executor, capitalize first letter
+			if len(m.task.Executor) > 0 {
+				return strings.ToUpper(m.task.Executor[:1]) + m.task.Executor[1:]
+			}
+		}
+	}
+	// Fallback to the global executor's display name
+	if m.executor != nil {
+		return m.executor.DisplayName()
+	}
+	return executor.DefaultExecutorName()
+}
+
+// StartRelatedTasksLoad starts loading related tasks from QMD if available.
+// Returns a tea.Cmd that can be batched with other commands.
+func (m *DetailModel) StartRelatedTasksLoad() tea.Cmd {
+	if m.task == nil || !qmd.DefaultClient.IsAvailable() {
+		return nil
+	}
+
+	// Build search query from task title and body
+	query := m.task.Title
+	if m.task.Body != "" {
+		// Truncate body to avoid overly long queries
+		body := m.task.Body
+		if len(body) > 200 {
+			body = body[:200]
+		}
+		query += " " + body
+	}
+
+	// Check if we already loaded for this query
+	if m.lastRelatedSearch == query && m.relatedTasksLoaded {
+		return nil
+	}
+
+	m.lastRelatedSearch = query
+	m.relatedTasksLoading = true
+	m.relatedTasksLoaded = false
+
+	return loadRelatedTasks(m.task.ID, query)
+}
+
+// UpdateTask updates the task and refreshes the view.
+// Returns a tea.Cmd if the executor changed and a switch is needed.
+func (m *DetailModel) UpdateTask(t *db.Task) tea.Cmd {
+	prevExecutor := ""
+	if m.task != nil {
+		prevExecutor = m.task.Executor
+	}
+
+	m.task = t
+	m.loadWorkflowSteps()
+	if m.ready {
+		m.setViewportContent()
+	}
+
+	// Detect executor change — trigger switch if we have an active window
+	if prevExecutor != "" && prevExecutor != t.Executor && m.cachedWindowTarget != "" {
+		return tea.Batch(m.restartForExecutorSwitch(prevExecutor), m.spinnerTick())
+	}
+
+	return nil
+}
+
+// loadWorkflowSteps caches the sibling steps of this task's workflow so the
+// detail view can show where the task sits in its flow. Opening a workflow step
+// otherwise gave no hint that it was part of a run at all, let alone which
+// phase came before it or what is still pending. Standalone tasks clear the
+// slice, so the section simply doesn't render for them.
+func (m *DetailModel) loadWorkflowSteps() {
+	m.workflowSteps = nil
+	if m.task == nil || m.database == nil || !pipeline.IsWorkflowTask(m.task) {
+		return
+	}
+	branch := pipeline.GroupKey(m.task)
+	if branch == "" {
+		return
+	}
+	// The board only holds active tasks; a workflow is illegible without its
+	// finished steps, so query directly and include closed ones.
+	tasks, err := m.database.ListTasks(db.ListTasksOptions{IncludeClosed: true, Limit: 5000})
+	if err != nil {
+		return
+	}
+	var steps []*db.Task
+	for _, t := range tasks {
+		if pipeline.GroupKey(t) == branch && pipeline.IsWorkflowTask(t) {
+			steps = append(steps, t)
+		}
+	}
+	sort.Slice(steps, func(i, j int) bool { return steps[i].ID < steps[j].ID })
+	if len(steps) < 2 {
+		// A lone member isn't a flow worth drawing.
+		return
+	}
+	m.workflowSteps = steps
+}
+
+// workflowStepsHash fingerprints the flow's rendered inputs (ids + statuses) so
+// renderContent's cache invalidates when a sibling step advances. Without this
+// the panel would freeze at whatever the flow looked like when first drawn.
+func (m *DetailModel) workflowStepsHash() uint64 {
+	if len(m.workflowSteps) == 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	for _, s := range m.workflowSteps {
+		fmt.Fprintf(h, "%d:%s;", s.ID, s.Status)
+	}
+	return h.Sum64()
+}
+
+// renderWorkflowFlow draws the run as a compact vertical flow, marking the step
+// you're looking at so "where am I in this pipeline?" is answerable at a glance.
+func (m *DetailModel) renderWorkflowFlow(dimmed bool) string {
+	if len(m.workflowSteps) == 0 {
+		return ""
+	}
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
+
+	done := 0
+	for _, s := range m.workflowSteps {
+		if s.Status == db.StatusDone {
+			done++
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(Bold.Render("Workflow"))
+	b.WriteString("\n\n")
+
+	header := fmt.Sprintf("  %d/%d steps complete", done, len(m.workflowSteps))
+	b.WriteString(dimStyle.Render(header))
+	b.WriteString("\n")
+
+	for _, s := range m.workflowSteps {
+		mark := "·"
+		switch s.Status {
+		case db.StatusDone:
+			mark = "✓"
+		case db.StatusProcessing:
+			mark = "▶"
+		case db.StatusQueued:
+			mark = "»"
+		case db.StatusBlocked:
+			mark = "⏸"
+		}
+
+		role := ""
+		if pipeline.IsGateStep(s) {
+			role = " (gate)"
+		}
+
+		name := workflowStepLabel(s.Title)
+		line := fmt.Sprintf("  %s %-22s %s%s", mark, name, s.Status, role)
+		if m.task != nil && s.ID == m.task.ID {
+			line += "   ← you are here"
+		}
+
+		switch {
+		case dimmed:
+			b.WriteString(dimStyle.Render(line))
+		case m.task != nil && s.ID == m.task.ID:
+			b.WriteString(Bold.Render(line))
+		case s.Status == db.StatusDone:
+			b.WriteString(dimStyle.Render(line))
+		default:
+			b.WriteString(line)
+		}
+		b.WriteString("\n")
+	}
+
+	if m.task != nil && pipeline.IsGateStep(m.task) && m.task.Status == db.StatusBlocked {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  ⏸ Human gate — approve with: ty close %d\n", m.task.ID)))
+	}
+	return b.String()
+}
+
+// workflowStepLabel pulls "design" out of a "[design] goal" title.
+func workflowStepLabel(title string) string {
+	title = strings.TrimSpace(title)
+	if strings.HasPrefix(title, "[") {
+		if end := strings.Index(title, "]"); end > 1 {
+			return title[1:end]
+		}
+	}
+	// Slice by runes, not bytes: a byte slice would corrupt a multi-byte character
+	// mid-sequence and mis-measure the visible width.
+	if r := []rune(title); len(r) > 22 {
+		return string(r[:21]) + "…"
+	}
+	return title
+}
+
+// restartForExecutorSwitch handles switching from one executor to another.
+// Captures pane content from the old executor, kills the window, and starts a new session.
+// All state flows back through panesJoinedMsg to avoid race conditions.
+func (m *DetailModel) restartForExecutorSwitch(prevExecutor string) tea.Cmd {
+	log := GetLogger()
+
+	// Capture pane content BEFORE killing the window.
+	// When panes are joined to the UI, the executor pane has been moved from the
+	// daemon window into the UI session — so capture from claudePaneID directly.
+	captureTarget := m.cachedWindowTarget // fallback to daemon window
+	if m.claudePaneID != "" {
+		captureTarget = m.claudePaneID // pane is in the UI session
+	}
+	capturedContent := executor.CapturePaneContent(captureTarget, 500)
+	log.Info("restartForExecutorSwitch: captured %d chars from %q (prev=%s, new=%s)",
+		len(capturedContent), captureTarget, prevExecutor, m.task.Executor)
+
+	// Kill the old executor window
+	windowName := executor.TmuxWindowName(m.task.ID)
+	executor.KillAllWindowsByNameAllSessions(windowName)
+
+	// Clear cached tmux state — new state arrives via panesJoinedMsg
+	m.cachedWindowTarget = ""
+	m.claudePaneID = ""
+	m.workdirPaneID = ""
+	m.paneLoading = true
+	m.paneLoadingStart = time.Now()
+	m.paneError = ""
+	m.paneNotice = ""
+
+	// Clear stale session ID (belongs to old executor)
+	m.database.UpdateTaskClaudeSessionID(m.task.ID, "")
+	m.task.ClaudeSessionID = ""
+
+	// Log the switch
+	m.database.AppendTaskLog(m.task.ID, "system",
+		fmt.Sprintf("Switching executor from %s to %s", prevExecutor, m.task.Executor))
+
+	// Capture values needed for the goroutine — don't access m.* in the closure
+	taskID := m.task.ID
+	newExecutor := m.task.Executor
+
+	return m.paneCommand(func() tea.Msg {
+		// Build handoff context from captured pane content
+		handoffContext := executor.FormatSessionHandoff(prevExecutor, capturedContent)
+
+		// Start the new session with handoff context
+		if err := m.startResumableSession("", handoffContext); err != nil {
+			log.Error("restartForExecutorSwitch: failed to start %s: %v", newExecutor, err)
+			if reason, halted := m.haltReason(err); halted {
+				m.logExecutorFailure(reason)
+				return paneSetupHaltedMsg{reason: reason}
+			}
+			userMsg := m.executorFailureMessage(err.Error())
+			m.logExecutorFailure(userMsg)
+			return panesJoinedMsg{err: err, userMessage: userMsg}
+		}
+
+		// Find the new window
+		windowTarget := m.findTaskWindow()
+		if windowTarget == "" {
+			log.Error("restartForExecutorSwitch: window not found after starting %s for task %d", newExecutor, taskID)
+			err := fmt.Errorf("%s window not found after switch", newExecutor)
+			userMsg := m.executorFailureMessage("the executor exited before panes could be created")
+			m.logExecutorFailure(userMsg)
+			return panesJoinedMsg{err: err, userMessage: userMsg}
+		}
+
+		// Join panes — state flows back via panesJoinedMsg
+		m.cachedWindowTarget = windowTarget
+		m.viewTaskWindow()
+
+		log.Info("restartForExecutorSwitch: completed switch to %s, claudePaneID=%q", newExecutor, m.claudePaneID)
+
+		return panesJoinedMsg{
+			claudePaneID:    m.claudePaneID,
+			workdirPaneID:   m.workdirPaneID,
+			daemonSessionID: m.daemonSessionID,
+			windowTarget:    windowTarget,
+			viewerPaneID:    m.viewerPaneID,
+			viewSession:     m.viewSession,
+		}
+	})
+}
+
+// SetPosition updates the task's position in its column.
+func (m *DetailModel) SetPosition(position, total int) {
+	m.positionInColumn = position
+	m.totalInColumn = total
+	// Update tmux pane title when position changes
+	m.updateTmuxPaneTitle()
+}
+
+// SetPRInfo sets the PR info for this task. Every task reload hands the stored
+// state back in, so an unchanged value is a no-op rather than a re-render.
+func (m *DetailModel) SetPRInfo(prInfo *github.PRInfo) {
+	if github.MarshalPRInfo(m.prInfo) == github.MarshalPRInfo(prInfo) {
+		return
+	}
+	m.prInfo = prInfo
+	if m.ready {
+		m.setViewportContent()
+	}
+}
+
+// Refresh reloads task and logs from database.
+// Returns a tea.Cmd if async work (like log loading) needs to happen.
+func (m *DetailModel) Refresh() tea.Cmd {
+	if m.task == nil || m.database == nil {
+		return nil
+	}
+
+	cmd := m.refreshSnapshotCmd()
+
+	// Throttle pane join checks (runs tmux commands)
+	// Poll faster (1s) while loading to reduce latency for "create and execute" flow,
+	// slower (5s) once panes are established for normal health checks
+	paneCheckInterval := 5 * time.Second
+	if m.paneLoading {
+		paneCheckInterval = 1 * time.Second
+	}
+	if time.Since(m.lastPaneCheck) >= paneCheckInterval {
+		m.lastPaneCheck = time.Now()
+		return tea.Batch(cmd, m.paneHealthCmd())
+	}
+
+	return cmd
+}
+
+// detailRefreshMsg carries read-only observations from a private snapshot.
+// The owner prevents a late result from updating another detail view.
+type detailRefreshMsg struct {
+	hostHealth                                 db.HostHealth
+	owner                                      *DetailModel
+	previousTask                               *db.Task
+	task                                       *db.Task
+	previousLogCount                           int
+	logs                                       []*db.TaskLog
+	logCount                                   int
+	memoryChecked, serverChecked, shellChecked bool
+	memoryMB                                   int
+	serverListening, shellRunning              bool
+	claudePaneID, shellPaneID                  string
+}
+
+func (m *DetailModel) refreshSnapshotCmd() tea.Cmd {
+	if m.refreshInFlight {
+		return nil
+	}
+	m.refreshInFlight = true
+	previous := m.task
+	taskCopy := *previous
+	worker := &DetailModel{task: &taskCopy, database: m.database, claudePaneID: m.claudePaneID, workdirPaneID: m.workdirPaneID, cachedWindowTarget: m.cachedWindowTarget}
+	result := detailRefreshMsg{owner: m, previousTask: previous, previousLogCount: m.lastLogCount, claudePaneID: m.claudePaneID, shellPaneID: m.workdirPaneID}
+	result.memoryChecked = time.Since(m.lastMemoryCheck) >= 3*time.Second
+	result.serverChecked = time.Since(m.lastServerCheck) >= 2*time.Second
+	result.shellChecked = time.Since(m.lastShellProcessPoll) >= 2*time.Second
+	lastLogCount, logsLoading := m.lastLogCount, m.logsLoading
+	return func() tea.Msg {
+		result.task, _ = worker.database.GetTask(taskCopy.ID)
+		result.hostHealth, _ = worker.database.RemoteHostHealth(taskCopy.PlacementTarget)
+		count, err := worker.database.GetTaskLogCount(taskCopy.ID)
+		if err == nil && count != lastLogCount && !logsLoading {
+			result.logs, _ = worker.database.GetTaskLogs(taskCopy.ID, 500)
+			result.logCount = count
+		}
+		if result.memoryChecked {
+			result.memoryMB = worker.getClaudeMemoryMB()
+		}
+		if result.serverChecked {
+			worker.checkServerListening()
+			result.serverListening = worker.serverListening
+		}
+		if result.shellChecked {
+			result.shellRunning = worker.HasRunningShellProcess()
+		}
+		return result
+	}
+}
+
+func (m *DetailModel) handleRefreshSnapshot(msg detailRefreshMsg) tea.Cmd {
+	if msg.owner != m {
+		return nil
+	}
+	m.refreshInFlight = false
+	if m.task == nil || msg.previousTask == nil || m.task.ID != msg.previousTask.ID {
+		return nil
+	}
+	if m.task.PlacementTarget == msg.previousTask.PlacementTarget {
+		m.hostHealth = msg.hostHealth
+	}
+	// Task events can replace the task while the read is in flight. Preserve
+	// that newer state instead of restoring a stale database snapshot.
+	if msg.task != nil && m.task == msg.previousTask {
+		m.task = msg.task
+	}
+	if msg.logs != nil && m.lastLogCount == msg.previousLogCount {
+		m.logs = msg.logs
+		m.lastLogCount = msg.logCount
+	}
+	if msg.serverChecked && m.task.Port == msg.previousTask.Port {
+		m.serverListening = msg.serverListening
+		m.lastServerCheck = time.Now()
+	}
+	if msg.shellChecked && m.workdirPaneID == msg.shellPaneID {
+		m.hasRunningShellProc = msg.shellRunning
+		m.lastShellProcessPoll = time.Now()
+	}
+	var titleCmd tea.Cmd
+	if msg.memoryChecked && m.claudePaneID == msg.claudePaneID {
+		m.claudeMemoryMB = msg.memoryMB
+		m.lastMemoryCheck = time.Now()
+		if m.claudePaneID != "" {
+			paneID, title := m.claudePaneID, m.executorDisplayName()
+			if msg.memoryMB > 0 {
+				title = fmt.Sprintf("%s (%d MB)", title, msg.memoryMB)
+			}
+			titleCmd = func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				defer cancel()
+				agentTmux(ctx, "select-pane", "-t", paneID, "-T", title).Run()
+				return nil
+			}
+		}
+	}
+	if m.ready {
+		m.setViewportContent()
+	}
+	return titleCmd
+}
+
+// HandleLogsLoaded processes the result of async log loading.
+func (m *DetailModel) HandleLogsLoaded(msg logsLoadedMsg) {
+	m.logsLoading = false
+	if msg.taskID != m.task.ID {
+		return // stale result from a different task
+	}
+	if msg.logs != nil {
+		m.logs = msg.logs
+		m.lastLogCount = msg.logCount
+		if m.ready {
+			m.setViewportContent()
+		}
+	}
+}
+
+// Task returns the current task.
+func (m *DetailModel) Task() *db.Task {
+	return m.task
+}
+
+// ClaudePaneID returns the tmux pane ID where Claude is running.
+func (m *DetailModel) ClaudePaneID() string {
+	if m.remotePaneID != "" {
+		return m.remotePaneID
+	}
+	return m.claudePaneID
+}
+
+// NewDetailModel creates a new detail model.
+// Returns the model and an optional command for async pane setup.
+// If focusExecutor is true, the executor pane will be focused after panes are joined.
+func NewDetailModel(t *db.Task, database *db.DB, exec *executor.Executor, width, height int, focusExecutor bool) (*DetailModel, tea.Cmd) {
+	log := GetLogger()
+	log.Info("NewDetailModel: creating for task %d (%s), focusExecutor=%v", t.ID, t.Title, focusExecutor)
+	log.Debug("NewDetailModel: TMUX env=%q, DaemonSession=%q, ClaudeSessionID=%q",
+		os.Getenv("TMUX"), t.DaemonSession, t.ClaudeSessionID)
+
+	m := &DetailModel{
+		task:                t,
+		database:            database,
+		executor:            exec,
+		width:               width,
+		height:              height,
+		focused:             true, // Initially focused when viewing details
+		focusExecutorOnJoin: focusExecutor,
+	}
+
+	// Load shell pane visibility preference from settings
+	if hiddenStr, err := database.GetSetting(config.SettingShellPaneHidden); err == nil && hiddenStr == "true" {
+		m.shellPaneHidden = true
+	}
+
+	// Load logs
+	logs, _ := database.GetTaskLogs(t.ID, 100)
+	m.logs = logs
+
+	m.initViewport()
+
+	// Skip initial memory check - it's expensive (3 shell commands)
+	// and will be fetched on the first Refresh() call instead
+	m.claudeMemoryMB = 0
+
+	// Check if we're in tmux
+	if os.Getenv("TMUX") == "" {
+		log.Info("NewDetailModel: not in tmux, skipping pane operations")
+		log.Info("NewDetailModel: completed for task %d", t.ID)
+		return m, nil
+	}
+
+	// Everything below is tmux I/O: resolving the UI session, searching for the
+	// task's window, and — on the common "executor already running" path — a
+	// ~30-call join/split/select/resize/option dance. Done synchronously here it
+	// froze the Bubble Tea update loop for the entire join, so pressing Enter on
+	// the board stalled before the detail view ever painted. Defer all of it to a
+	// background command: paint the view instantly with a loading spinner, then
+	// drop the panes in when setupPanesAsync reports back via panesJoinedMsg /
+	// paneWaitForExecutorMsg.
+	m.paneLoading = true
+	m.paneError = ""
+	m.paneNotice = ""
+	m.paneLoadingStart = time.Now()
+	log.Info("NewDetailModel: completed for task %d (async pane setup pending)", t.ID)
+	return m, tea.Batch(m.setupPanesAsync(), m.spinnerTick())
+}
+
+// setupPanesAsync resolves the task's tmux window and joins (or starts) its panes
+// entirely off the UI thread. It mirrors the decision tree that used to run
+// synchronously inside NewDetailModel, but every tmux call now happens in this
+// goroutine so opening the detail view stays instant. Results flow back to the
+// model through panesJoinedMsg / paneWaitForExecutorMsg — matching the existing
+// startPanesAsync contract for goroutine-produced pane state.
+func (m *DetailModel) setupPanesAsync() tea.Cmd {
+	taskID := m.task.ID
+	sessionID := m.task.ClaudeSessionID
+	worktreePath, worktreeMissing := taskWorktreeMissing(m.task)
+	action := pendingPaneAction(m.task, worktreeMissing)
+	remoteLoc, isRemote := m.remoteTaskLocation()
+
+	return m.paneCommand(func() tea.Msg {
+		log := GetLogger()
+		log.Info("setupPanesAsync: starting for task %d", taskID)
+
+		// A deliberate halt (missing worktree, refused adopt, tripped breaker) is
+		// terminal until the user acts. Never re-enter setup while it stands.
+		if m.paneSetupHalted != "" {
+			log.Info("setupPanesAsync: task %d halted (%s); not retrying", taskID, m.paneSetupHalted)
+			return paneSetupHaltedMsg{reason: m.paneSetupHalted}
+		}
+
+		// Worktree gone: stop before any tmux call. There is nothing to start (the
+		// agent would land in $HOME) and nothing to join (no pane in $HOME could
+		// pass the worktree ownership check).
+		if action == paneActionWorktreeMissing {
+			log.Error("setupPanesAsync: task %d records worktree %q, which is not on disk; not starting an executor", taskID, worktreePath)
+			m.logExecutorFailure(fmt.Sprintf("Worktree %s is missing; no executor was started for this task.", worktreePath))
+			return paneSetupHaltedMsg{reason: worktreeMissingMessage(worktreePath)}
+		}
+
+		// Placed on another machine: there is no local window to join, and every
+		// tmux call below would search this machine's server for one that only
+		// exists on the host the task runs on. Its session is shown by attaching to
+		// THAT host's tmux inside a local pane instead.
+		if isRemote {
+			log.Info("setupPanesAsync: task %d is placed on %s; attaching to its session", taskID, remoteLoc.Host)
+			return m.setupRemotePane(remoteLoc)
+		}
+
+		// Cleanup can invoke tmux/process checks. Keep it with the asynchronous
+		// pane setup so the detail view can paint immediately.
+		//
+		// There is no SIGCONT step here any more: a suspended task's window is
+		// killed outright, so opening it falls through to startResumableSession,
+		// which relaunches the agent with --resume.
+		if m.executor != nil {
+			m.executor.CleanupDuplicateWindows(taskID)
+		}
+
+		// Resolve the actual UI session name (avoid prefix-matching the wrong
+		// session, and avoid naming another instance's — see ownSessionName).
+		sessionCtx, cancelSession := context.WithTimeout(context.Background(), 5*time.Second)
+		m.uiSessionName = ownSessionName(sessionCtx)
+		cancelSession()
+
+		// Find the task's existing window (one tmux call).
+		m.cachedWindowTarget = m.findTaskWindow()
+		log.Info("setupPanesAsync: cachedWindowTarget=%q", m.cachedWindowTarget)
+
+		// Fast path: an active window exists AND still holds a live executor — join
+		// it. This is the heavy ~30-call path that used to block the UI thread.
+		//
+		// A window left with only its `tail` placeholder and/or a shell (its executor
+		// exited — e.g. a pre-#577 resume against the wrong CLAUDE_CONFIG_DIR) must NOT
+		// be rejoined: doing so reconnects to a dead pane forever and never reruns
+		// BuildCommand. Kill the stale window so the start path below rebuilds the
+		// executor (with the correct per-project config dir).
+		if m.cachedWindowTarget != "" && !m.windowHasLiveExecutor(m.cachedWindowTarget) {
+			if m.killStaleWindow(m.cachedWindowTarget) {
+				log.Info("setupPanesAsync: window %q has no live executor; killed it to rebuild", m.cachedWindowTarget)
+				m.cachedWindowTarget = ""
+			}
+		}
+		if m.cachedWindowTarget != "" {
+			m.viewTaskWindow()
+			if m.paneAdoptRejected {
+				return paneSetupHaltedMsg{reason: adoptRejectedMessage(m.executorDisplayName())}
+			}
+			log.Info("setupPanesAsync: joined existing window, claudePaneID=%q, workdirPaneID=%q",
+				m.claudePaneID, m.workdirPaneID)
+			return panesJoinedMsg{
+				claudePaneID:    m.claudePaneID,
+				workdirPaneID:   m.workdirPaneID,
+				daemonSessionID: m.daemonSessionID,
+				windowTarget:    m.cachedWindowTarget,
+				viewerPaneID:    m.viewerPaneID,
+				viewSession:     m.viewSession,
+			}
+		}
+
+		// No window — decide based on task status (pure decision, no tmux).
+		switch action {
+		case paneActionSkip:
+			// Backlog/done/archived: don't auto-start an executor. Clear loading,
+			// no panes, no error.
+			log.Info("setupPanesAsync: skipping auto-executor for task %d", taskID)
+			return panesJoinedMsg{}
+		case paneActionWaitForExecutor:
+			// Freshly queued task with no worktree: the daemon's executor will create
+			// the window shortly. Keep the spinner and let ensureTmuxPanesJoined poll
+			// the panes in once they appear.
+			log.Info("setupPanesAsync: task %d queued without worktree, waiting for executor", taskID)
+			return paneWaitForExecutorMsg{}
+		default:
+			// Slow path: no window yet — start the executor session, then join.
+			return m.startAndJoinSession(sessionID)
+		}
+	})
+}
+
+// startPanesAsync returns a command that starts the Claude session and joins panes in the background.
+func (m *DetailModel) startPanesAsync() tea.Cmd {
+	sessionID := m.task.ClaudeSessionID
+	remoteLoc, isRemote := m.remoteTaskLocation()
+	return m.paneCommand(func() tea.Msg {
+		// Never start a second agent here for a task that is already running
+		// somewhere else — show the one that is running there.
+		if isRemote {
+			return m.setupRemotePane(remoteLoc)
+		}
+		return m.startAndJoinSession(sessionID)
+	})
+}
+
+// remoteTaskLocation returns where a remotely placed task is running, and false
+// for an ordinary local task.
+func (m *DetailModel) remoteTaskLocation() (executor.RemoteTaskLocation, bool) {
+	if m.task == nil || m.executor == nil {
+		return executor.RemoteTaskLocation{}, false
+	}
+	return m.executor.RemoteLocation(m.task)
+}
+
+// setupRemotePane shows a remotely placed task's session where a local task's
+// pane would be.
+//
+// ty already knows the exact ssh+tmux command that reaches the agent; printing
+// it for the user to copy was never the best it could do. tmux nests, so
+// attaching that session inside a local pane renders it live and takes keystrokes
+// like any other pane.
+//
+// The three answers a probe can give are all handled, and none of them blanks the
+// pane: live attaches, ended says so and keeps the manual command visible, and
+// unreachable says the host cannot be seen — which is emphatically NOT the same
+// as the task being over.
+//
+// Runs in the pane-setup goroutine: every branch here makes an ssh round trip.
+func (m *DetailModel) setupRemotePane(loc executor.RemoteTaskLocation) tea.Msg {
+	log := GetLogger()
+	if m.task == nil || m.executor == nil {
+		return paneRemoteMsg{message: executor.RemoteTaskMessage(loc)}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	switch m.executor.RemoteSessionState(ctx, m.task) {
+	case executor.RemoteSessionLive:
+		if paneID := m.attachRemotePane(loc); paneID != "" {
+			return paneRemoteAttachedMsg{paneID: paneID, notice: executor.RemoteAttachNotice(loc), shellHidden: m.remoteShellPaneID == ""}
+		}
+		// Attaching failed locally (no tmux, split refused). Never leave the user
+		// with nothing: fall back to the text that tells them how to get there.
+		log.Error("setupRemotePane: could not create an attach pane for task %d", m.task.ID)
+		return paneRemoteMsg{message: executor.RemoteTaskMessage(loc)}
+	case executor.RemoteSessionUnreachable:
+		return paneRemoteMsg{message: executor.RemoteUnreachableMessage(loc)}
+	default:
+		return paneRemoteMsg{message: executor.RemoteEndedMessage(loc)}
+	}
+}
+
+// attachRemotePane creates the local pane that runs the ssh attach, and returns
+// its pane id ("" if it could not be created).
+//
+// It is deliberately much smaller than joinTmuxPanes. There is no daemon pane to
+// borrow, no ownership guard to run and nothing to break back afterwards: the
+// pane holds an ssh client this view started, so it is created here and killed
+// in closeRemotePane.
+func (m *DetailModel) attachRemotePane(loc executor.RemoteTaskLocation) string {
+	log := GetLogger()
+	if os.Getenv("TMUX") == "" {
+		return ""
+	}
+
+	// Same serialization as a local join: these commands mutate the shared
+	// task-ui layout.
+	tmuxPaneOpMu.Lock()
+	defer tmuxPaneOpMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if m.uiSessionName == "" {
+		m.uiSessionName = ownSessionName(ctx)
+	}
+
+	tuiPaneID := ownPaneID()
+	if tuiPaneID == "" {
+		log.Error("attachRemotePane: no $TMUX_PANE; refusing to guess this instance's pane")
+		return ""
+	}
+	m.tuiPaneID = tuiPaneID
+
+	// Clear view panes the previously viewed task left behind, so the remote
+	// pane is not stacked under them. Only ty's own panes: the TUI may share its
+	// window with the user's (ty run inside their tmux).
+	removeStaleViewers(ctx, tuiPaneID)
+
+	// A remote task has no local task-window view, so the TUI pane must not
+	// claim one. Left over from a local task, the pairing sends every
+	// Shift+arrow from the TUI through paneCycleScript, which selects a viewer
+	// pane and a view session that are both gone — the key does nothing and the
+	// keyboard is stuck in the TUI. Here the panes are plain panes of this
+	// window, which is what the unpaired binding already cycles.
+	clearViewPairing(ctx, tuiPaneID)
+
+	script := diesWithTUI(executor.RemoteAttachScript(m.task, loc))
+	out, err := uiTmux(ctx, "split-window",
+		"-v", "-d",
+		"-t", tuiPaneID,
+		"-P", "-F", "#{pane_id}",
+		script).Output()
+	if err != nil {
+		log.Error("attachRemotePane: split-window failed: %v", err)
+		return ""
+	}
+	paneID := strings.TrimSpace(string(out))
+	if paneID == "" {
+		return ""
+	}
+	uiTmux(ctx, "set-option", "-p", "-t", paneID, viewerOption, "remote").Run()
+	log.Info("attachRemotePane: attached task %d to %s in pane %s", m.task.ID, loc.Host, paneID)
+
+	// Say where the pane goes and which prefix reaches its tmux, in the two places
+	// a user actually looks: the pane's own border title and the status bar.
+	uiTmux(ctx, "select-pane", "-t", paneID, "-T",
+		fmt.Sprintf("%s (remote) — prefix %s", loc.Host, executor.RemoteInnerPrefixHuman)).Run()
+	uiTmux(ctx, "set-option", "-t", m.uiSessionName, "status", "on").Run()
+	uiTmux(ctx, "set-option", "-t", m.uiSessionName, "status-right-length", "80").Run()
+	uiTmux(ctx, "set-option", "-t", m.uiSessionName, "status-right",
+		fmt.Sprintf(" remote pane: %s is its tmux prefix ", executor.RemoteInnerPrefixHuman)).Run()
+	uiTmux(ctx, "set-option", "-t", m.uiSessionName, "pane-border-lines", "heavy").Run()
+	uiTmux(ctx, "set-option", "-t", m.uiSessionName, "pane-border-indicators", "arrows").Run()
+
+	// Give the TUI its configured share of the window and keep the keyboard,
+	// matching what a local join leaves behind.
+	uiTmux(ctx, "resize-pane", "-t", tuiPaneID, "-y", m.getDetailPaneHeight()).Run()
+	uiTmux(ctx, "select-pane", "-t", tuiPaneID, "-T", m.getPaneTitle()).Run()
+	uiTmux(ctx, "select-pane", "-t", tuiPaneID).Run()
+	m.remotePaneID = paneID // Cleanup must see it even before the result is delivered.
+	m.bindPaneNavigation(ctx)
+	if !m.shellPaneHidden {
+		if err := m.showRemoteShellPane(ctx, loc); err != nil {
+			m.logExecutorFailure(err.Error())
+		}
+	}
+	if m.focusExecutorOnJoin {
+		uiTmux(ctx, "select-pane", "-t", paneID).Run()
+	}
+	return paneID
+}
+
+// closeRemotePane kills the attach pane, which drops the ssh client, which
+// detaches the grouped view session on the host — where destroy-unattached then
+// disposes of it. The remote agent and workdir shell keep running.
+func (m *DetailModel) closeRemotePane(resizeTUI bool) {
+	if m.remotePaneID == "" && m.remoteShellPaneID == "" {
+		return
+	}
+	tmuxPaneOpMu.Lock()
+	defer tmuxPaneOpMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if m.remoteShellPaneID != "" {
+		m.killPaneWithProcess(ctx, m.remoteShellPaneID)
+		m.remoteShellPaneID = ""
+	}
+	m.killPaneWithProcess(ctx, m.remotePaneID)
+	m.remotePaneID = ""
+	runTmuxBatch(ctx, [][]string{
+		{"unbind-key", "-T", "root", "S-Down"},
+		{"unbind-key", "-T", "root", "S-Right"},
+		{"unbind-key", "-T", "root", "S-Up"},
+		{"unbind-key", "-T", "root", "S-Left"},
+		{"unbind-key", "-T", "root", "M-S-Up"},
+		{"unbind-key", "-T", "root", "M-S-Down"},
+	})
+
+	if m.uiSessionName != "" {
+		uiTmux(ctx, "set-option", "-t", m.uiSessionName, "status-right", " ").Run()
+	}
+	if resizeTUI && m.tuiPaneID != "" {
+		uiTmux(ctx, "resize-pane", "-t", m.tuiPaneID, "-y", "100%").Run()
+	}
+}
+
+// startAndJoinSession starts the task's executor session, locates its window, and
+// joins the panes, returning the resulting panesJoinedMsg. It is the shared body
+// of the async "no active window" path used by both startPanesAsync and
+// setupPanesAsync. Runs in a goroutine — never call it on the UI thread.
+func (m *DetailModel) startAndJoinSession(sessionID string) tea.Msg {
+	log := GetLogger()
+	log.Info("startAndJoinSession: starting for task %d", m.task.ID)
+
+	// Start the Claude session (creates tmux window)
+	if err := m.startResumableSession(sessionID); err != nil {
+		if reason, halted := m.haltReason(err); halted {
+			m.logExecutorFailure(reason)
+			return paneSetupHaltedMsg{reason: reason}
+		}
+		userMsg := m.executorFailureMessage(err.Error())
+		m.logExecutorFailure(userMsg)
+		return panesJoinedMsg{err: err, userMessage: userMsg}
+	}
+
+	// Find the window target
+	windowTarget := m.findTaskWindow()
+	log.Info("startAndJoinSession: after startResumableSession, windowTarget=%q", windowTarget)
+
+	if windowTarget == "" {
+		log.Error("startAndJoinSession: failed to find window after starting session")
+		err := fmt.Errorf("%s session window not found", m.executorDisplayName())
+		userMsg := m.executorFailureMessage("the executor exited before panes could be created")
+		m.logExecutorFailure(userMsg)
+		return panesJoinedMsg{err: err, userMessage: userMsg}
+	}
+
+	// Join the panes
+	m.cachedWindowTarget = windowTarget
+	m.viewTaskWindow()
+	// The pane we just started was refused as not ours. Falling back into pane
+	// setup here is what respawned an executor every ~10 seconds; stop instead.
+	if m.paneAdoptRejected {
+		reason := adoptRejectedMessage(m.executorDisplayName())
+		m.logExecutorFailure(reason)
+		return paneSetupHaltedMsg{reason: reason}
+	}
+
+	log.Info("startAndJoinSession: completed, claudePaneID=%q, workdirPaneID=%q",
+		m.claudePaneID, m.workdirPaneID)
+
+	return panesJoinedMsg{
+		claudePaneID:    m.claudePaneID,
+		workdirPaneID:   m.workdirPaneID,
+		daemonSessionID: m.daemonSessionID,
+		windowTarget:    windowTarget,
+		viewerPaneID:    m.viewerPaneID,
+		viewSession:     m.viewSession,
+	}
+}
+
+// logExecutorFailure writes a system log entry explaining why the executor panes
+// failed to open so that the user can see the reason without digging into tmux.
+func (m *DetailModel) logExecutorFailure(message string) {
+	if message == "" || m.database == nil || m.task == nil {
+		return
+	}
+	// Best effort - ignore error, logs table already handles concurrency.
+	m.database.AppendTaskLog(m.task.ID, "error", message)
+}
+
+// errExecutorSpawnLoop is returned by startResumableSession when the per-task
+// spawn breaker refuses another launch.
+var errExecutorSpawnLoop = errors.New("executor spawn breaker tripped")
+
+// haltReason maps a start failure that must NOT be retried automatically to the
+// message the view shows for it. Ordinary failures ("claude: command not found")
+// return false and keep the existing retryable error path.
+func (m *DetailModel) haltReason(err error) (string, bool) {
+	switch {
+	case errors.Is(err, executor.ErrWorktreeMissing):
+		path := ""
+		if m.task != nil {
+			path = m.task.WorktreePath
+		}
+		return worktreeMissingMessage(path), true
+	case errors.Is(err, errExecutorSpawnLoop), errors.Is(err, executor.ErrExecutorRestartLoop):
+		return spawnLoopMessage(m.executorDisplayName()), true
+	}
+	return "", false
+}
+
+// executorFailureMessage formats a user-friendly error string for the header.
+func (m *DetailModel) executorFailureMessage(details string) string {
+	executorName := m.executorDisplayName()
+	base := fmt.Sprintf("%s failed to start", executorName)
+	if details != "" {
+		base = fmt.Sprintf("%s: %s", base, details)
+	}
+	return base + ". Check your executor configuration."
+}
+
+// spinnerTick returns a command that ticks the loading spinner.
+func (m *DetailModel) spinnerTick() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg{}
+	})
+}
+
+// headerHeight is the vertical space reserved above the viewport: the rendered
+// header plus the box chrome around it.
+//
+// It is measured, not assumed. renderHeader emits a variable number of lines —
+// the badge row, a PR link, a server URL, host and placement lines, a pane
+// notice, an executor failure, the stand — and a fixed reservation made every
+// extra line overflow the pane by a row. The terminal then scrolled the top
+// away, taking the box border and the badge row (status, PINNED, project, PR
+// status) with it. renderHeader costs ~12µs, so measuring it here is cheap.
+func (m *DetailModel) headerHeight() int {
+	if m.task == nil {
+		return headerChromeHeight
+	}
+	h := lipgloss.Height(m.renderHeader()) + headerChromeHeight
+	if IsGlobalDangerousMode() {
+		h++ // full-width danger banner above the box
+	}
+	return h
+}
+
+// headerChromeHeight is the non-header vertical space View() puts around the
+// viewport: the box's top and bottom border rows, and the scroll-percentage row
+// below the content.
+const headerChromeHeight = 3
+
+// footerHeight is the vertical space the help row below the box occupies. Like
+// the header it is measured — the help bar carries vertical padding and its
+// height is a style decision, not a constant to keep in sync by hand.
+func (m *DetailModel) footerHeight() int {
+	// Measured from a fixed shape rather than from whatever the footer happens
+	// to render right now: the help row differs while composing, and letting
+	// that feed back into the viewport's height made the whole pane jump a row
+	// as focus moved in and out of the box.
+	height := lipgloss.Height(m.renderHelpRow(false))
+	if ComposerEnabled {
+		height += m.prompt.height()
+		if m.AwayFromBottom() {
+			height++
+		}
+	}
+	return height
+}
+
+// MessageAtViewport is the message the reader is looking at: the last one that
+// starts at or above the top of the pane.
+func (m *DetailModel) MessageAtViewport() (*db.TaskLog, bool) {
+	if len(m.messageAnchors) == 0 || len(m.logs) == 0 {
+		return nil, false
+	}
+	chosen := m.messageAnchors[0]
+	for _, anchor := range m.messageAnchors {
+		if anchor.Line <= m.viewport.YOffset {
+			chosen = anchor
+		}
+	}
+	if chosen.LogIndex < 0 || chosen.LogIndex >= len(m.logs) {
+		return nil, false
+	}
+	return m.logs[chosen.LogIndex], true
+}
+
+// QuoteIntoComposer puts a message into the message box as a quote, which is
+// what the app's "add to chat" does.
+func (m *DetailModel) QuoteIntoComposer(log *db.TaskLog) {
+	if log == nil || !m.prompt.ready {
+		return
+	}
+	var quoted strings.Builder
+	started := false
+	for _, line := range strings.Split(strings.TrimSpace(log.Content), "\n") {
+		if !started && strings.TrimSpace(line) == "" {
+			continue
+		}
+		started = true
+		if strings.TrimSpace(line) == "" {
+			quoted.WriteString(">\n")
+			continue
+		}
+		quoted.WriteString("> " + line + "\n")
+	}
+	quoted.WriteString("\n")
+
+	existing := m.prompt.input.Value()
+	if strings.TrimSpace(existing) != "" {
+		existing += "\n"
+	}
+	m.prompt.input.SetValue(existing + quoted.String())
+	m.prompt.input.CursorEnd()
+	m.prompt.resize()
+	m.prompt.focus()
+	m.cachedViewOK = false
+}
+
+// ScrollLines moves the conversation by lines and updates whether it is still
+// following new messages.
+func (m *DetailModel) ScrollLines(delta int) {
+	if delta < 0 {
+		m.viewport.LineUp(-delta)
+	} else {
+		m.viewport.LineDown(delta)
+	}
+	m.stickyBottom = m.viewport.AtBottom()
+	m.cachedViewOK = false
+}
+
+// JumpMessage moves the viewport to the previous or next message boundary,
+// which is what a reader means by "back one" in a conversation — a line at a
+// time is the wrong unit when a single reply can be forty lines.
+func (m *DetailModel) JumpMessage(direction int) {
+	if len(m.messageAnchors) == 0 {
+		if direction < 0 {
+			m.viewport.GotoTop()
+		} else {
+			m.ScrollToBottom()
+		}
+		return
+	}
+
+	current := m.viewport.YOffset
+	target := -1
+	if direction < 0 {
+		for _, anchor := range m.messageAnchors {
+			if anchor.Line < current {
+				target = anchor.Line
+			}
+		}
+		if target == -1 {
+			m.viewport.GotoTop()
+			m.stickyBottom = false
+			m.cachedViewOK = false
+			return
+		}
+	} else {
+		for _, anchor := range m.messageAnchors {
+			if anchor.Line > current {
+				target = anchor.Line
+				break
+			}
+		}
+		if target == -1 {
+			m.ScrollToBottom()
+			return
+		}
+	}
+
+	m.viewport.SetYOffset(target)
+	m.stickyBottom = m.viewport.AtBottom()
+	m.cachedViewOK = false
+}
+
+// ScrollToBottom jumps to the newest message and re-arms following it.
+func (m *DetailModel) ScrollToBottom() {
+	m.viewport.GotoBottom()
+	m.stickyBottom = true
+	m.cachedViewOK = false
+}
+
+// AwayFromBottom reports whether the reader has scrolled back, which is when
+// the jump-to-latest affordance is worth showing.
+func (m *DetailModel) AwayFromBottom() bool {
+	return ConversationView && m.ready && !m.viewport.AtBottom()
+}
+
+// ComposerHeight is what the composer currently occupies, so the view above it
+// can be sized and a click can be attributed to it.
+func (m *DetailModel) ComposerHeight() int {
+	if !ComposerEnabled {
+		return 0
+	}
+	return m.prompt.height()
+}
+
+// ComposerFocused reports whether keystrokes belong to the message box rather
+// than to the board's single-key actions.
+func (m *DetailModel) ComposerFocused() bool {
+	return ComposerEnabled && m.prompt.ready && m.prompt.focused
+}
+
+// FocusComposer puts the cursor in the message box.
+func (m *DetailModel) FocusComposer() {
+	if ComposerEnabled && m.prompt.ready {
+		m.prompt.focus()
+		m.cachedViewOK = false
+	}
+}
+
+// BlurComposer returns to single-key browsing.
+func (m *DetailModel) BlurComposer() {
+	if ComposerEnabled && m.prompt.ready {
+		m.prompt.blur()
+		m.cachedViewOK = false
+	}
+}
+
+// OpenComposerPicker shows the model or permission chooser.
+func (m *DetailModel) OpenComposerPicker(kind MenuKind, items []SlashItem, current string) {
+	if !ComposerEnabled || !m.prompt.ready {
+		return
+	}
+	m.prompt.openPicker(kind, items, current)
+	m.cachedViewOK = false
+}
+
+// ComposerPickerOpen reports whether the open menu changes the composer rather
+// than the message.
+func (m *DetailModel) ComposerPickerOpen() bool {
+	return ComposerEnabled && m.prompt.ready && m.prompt.isPicker()
+}
+
+// TakeComposerPick returns what the picker chose.
+func (m *DetailModel) TakeComposerPick() (MenuKind, string, bool) {
+	kind := m.prompt.pickerKind()
+	item, ok := m.prompt.pickedItem()
+	m.prompt.closeMenu()
+	m.cachedViewOK = false
+	if !ok {
+		return kind, "", false
+	}
+	return kind, item.Scope, true
+}
+
+// SetComposerOverride records what the next message will use, and shows it on
+// the chip so the choice is visible before it is sent.
+func (m *DetailModel) SetComposerOverride(model, permission string) {
+	if model != "" {
+		m.prompt.overrideModel = model
+		m.prompt.context.Model = model
+	}
+	if permission != "" {
+		m.prompt.overridePermission = permission
+		m.prompt.context.Permission = permission
+	}
+	m.cachedViewOK = false
+}
+
+// ComposerSelection reports the overrides chosen for the next message.
+func (m *DetailModel) ComposerSelection() (string, string) {
+	return m.prompt.overrideModel, m.prompt.overridePermission
+}
+
+// ComposerMenuOpen reports whether the slash menu is showing, which changes
+// what enter and the arrow keys mean.
+func (m *DetailModel) ComposerMenuOpen() bool {
+	return ComposerEnabled && m.prompt.ready && m.prompt.menuOpen()
+}
+
+// MoveComposerMenu changes the highlighted completion.
+func (m *DetailModel) MoveComposerMenu(delta int) {
+	m.prompt.menuMove(delta)
+	m.cachedViewOK = false
+}
+
+// AcceptComposerMenu inserts the highlighted completion.
+func (m *DetailModel) AcceptComposerMenu() bool {
+	accepted := m.prompt.acceptMenu()
+	m.cachedViewOK = false
+	return accepted
+}
+
+// CloseComposerMenu dismisses the completions without inserting one.
+func (m *DetailModel) CloseComposerMenu() {
+	m.prompt.closeMenu()
+	m.cachedViewOK = false
+}
+
+// AttachFile stages a file that did not come from the message text, such as an
+// image pasted from the clipboard.
+func (m *DetailModel) AttachFile(path string) {
+	m.prompt.attachPath(path)
+	m.cachedViewOK = false
+}
+
+// TakeComposerAttachments returns and clears the files staged for sending.
+func (m *DetailModel) TakeComposerAttachments() []Attachment {
+	return m.prompt.takeAttachments()
+}
+
+// ClearComposerAttachments drops staged files without sending them.
+func (m *DetailModel) ClearComposerAttachments() {
+	m.prompt.clearAttachments()
+	m.cachedViewOK = false
+}
+
+// TakeComposerMessage returns and clears whatever has been typed.
+func (m *DetailModel) TakeComposerMessage() string {
+	if !ComposerEnabled || !m.prompt.ready {
+		return ""
+	}
+	text := m.prompt.value()
+	if text != "" {
+		m.prompt.reset()
+		m.cachedViewOK = false
+	}
+	return text
+}
+
+// SetComposerError shows why a send failed, in place of the hint.
+func (m *DetailModel) SetComposerError(message string) {
+	if ComposerEnabled && m.prompt.ready {
+		m.prompt.err = message
+		m.cachedViewOK = false
+	}
+}
+
+// UpdateComposer feeds a keystroke to the message box.
+func (m *DetailModel) UpdateComposer(msg tea.Msg) tea.Cmd {
+	cmd, handled := m.prompt.update(msg)
+	if handled {
+		m.prompt.err = ""
+		m.prompt.captureAttachments()
+		m.prompt.syncMenu(func(kind MenuKind, query string) []SlashItem {
+			if MenuItemsHook == nil || m.task == nil {
+				return nil
+			}
+			return MenuItemsHook(m.task.ID, kind, query)
+		})
+		m.cachedViewOK = false
+	}
+	return cmd
+}
+
+func (m *DetailModel) initViewport() {
+	// If we have joined panes, we have less height (tmux split takes space)
+	vpHeight := m.height - m.headerHeight() - m.footerHeight()
+
+	m.viewport = viewport.New(m.width-4, vpHeight)
+	if ComposerEnabled && !m.prompt.ready {
+		m.prompt = newComposer(m.width)
+	}
+	m.stickyBottom = true
+	m.setViewportContent()
+	m.ready = true
+}
+
+// SetSize updates the viewport size.
+func (m *DetailModel) SetSize(width, height int) {
+	m.width = width
+	m.height = height
+	m.prompt.setWidth(width)
+	m.reflowViewport()
+}
+
+// reflowViewport recomputes the viewport dimensions from the current width,
+// height, and header layout. Called on resize and whenever something that
+// changes the header height is updated.
+func (m *DetailModel) reflowViewport() {
+	if !m.ready {
+		return
+	}
+	m.viewport.Width = m.width - 4
+	m.viewport.Height = m.height - m.headerHeight() - m.footerHeight()
+	m.setViewportContent()
+}
+
+// ToggleHelpExpanded flips the footer help row between the collapsed (primary
+// actions + '?') and expanded (all actions) states.
+func (m *DetailModel) ToggleHelpExpanded() {
+	m.helpExpanded = !m.helpExpanded
+	m.cachedViewOK = false
+}
+
+// Update handles messages.
+func (m *DetailModel) Update(msg tea.Msg) (*DetailModel, tea.Cmd) {
+	var cmd tea.Cmd
+	defer m.syncStickyBottom()
+
+	switch msg := msg.(type) {
+	case remoteShellToggledMsg:
+		m.paneLoading = false
+		m.shellPaneHidden = msg.hidden
+		m.paneError = ""
+		if msg.err != nil {
+			m.paneError = msg.err.Error()
+		}
+		m.setViewportContent()
+		return m, nil
+	case paneHealthMsg:
+		return m, m.applyPaneHealth(msg)
+	case detailPaneResultMsg:
+		if msg.owner != m {
+			return m, nil
+		}
+		return m.Update(msg.result)
+	case panesJoinedMsg:
+		// Async pane setup completed
+		log := GetLogger()
+		m.paneLoading = false
+		m.waitingForExecutor = false
+		if msg.err != nil {
+			log.Error("panesJoinedMsg: error=%v", msg.err)
+			m.paneError = msg.userMessage
+		} else {
+			log.Info("panesJoinedMsg: claudePaneID=%q, workdirPaneID=%q",
+				msg.claudePaneID, msg.workdirPaneID)
+			if msg.claudePaneID != "" && m.task != nil {
+				// A launch finally produced a usable pane: forget this task's spawn
+				// history so a long-running healthy view never trips the breaker.
+				executorSpawns.adopted(m.task.ID)
+			}
+			m.claudePaneID = msg.claudePaneID
+			m.workdirPaneID = msg.workdirPaneID
+			m.daemonSessionID = msg.daemonSessionID
+			m.cachedWindowTarget = msg.windowTarget
+			m.viewerPaneID = msg.viewerPaneID
+			m.viewSession = msg.viewSession
+			m.paneError = ""
+			m.paneNotice = ""
+			// Focus executor pane if requested (e.g., when jumping from notification)
+			if m.focusExecutorOnJoin && m.claudePaneID != "" {
+				m.focusExecutorPane()
+			}
+		}
+		m.setViewportContent()
+		return m, nil
+
+	case paneSetupHaltedMsg:
+		// Pane setup stopped on purpose. Stop the spinner, show why, and — the
+		// point of the whole change — do not schedule another attempt.
+		log := GetLogger()
+		log.Info("paneSetupHaltedMsg: task %d halted: %s", m.task.ID, msg.reason)
+		m.paneLoading = false
+		m.waitingForExecutor = false
+		m.paneSetupHalted = msg.reason
+		m.paneNotice = ""
+		m.paneError = msg.reason
+		m.setViewportContent()
+		return m, nil
+
+	case paneRemoteMsg:
+		// Not a failure: the task is running, just not here. Stop the spinner, show
+		// where it is, and leave the pane state empty.
+		m.paneLoading = false
+		m.waitingForExecutor = false
+		m.paneError = ""
+		m.paneNotice = msg.message
+		m.setViewportContent()
+		return m, nil
+
+	case paneRemoteAttachedMsg:
+		// The remote session is rendering in a local pane. It is not a joined
+		// daemon pane, so claudePaneID stays empty and none of the join/break
+		// machinery touches it.
+		m.paneLoading = false
+		m.waitingForExecutor = false
+		m.paneError = ""
+		m.remotePaneID = msg.paneID
+		m.shellPaneHidden = msg.shellHidden
+		m.paneNotice = msg.notice
+		m.setViewportContent()
+		return m, nil
+
+	case paneWaitForExecutorMsg:
+		// A freshly queued task with no worktree yet: keep the spinner up and let
+		// the Refresh() poll join the executor's panes once the daemon creates them.
+		m.paneLoading = true
+		m.waitingForExecutor = true
+		m.paneError = ""
+		m.paneNotice = ""
+		m.setViewportContent()
+		return m, m.spinnerTick()
+
+	case logsLoadedMsg:
+		// Async log loading completed
+		m.HandleLogsLoaded(msg)
+		return m, nil
+
+	case spinnerTickMsg:
+		// Update spinner animation while loading
+		if m.paneLoading {
+			m.setViewportContent()
+			return m, m.spinnerTick()
+		}
+		return m, nil
+
+	case relatedTasksMsg:
+		// Related tasks loaded from QMD
+		if m.task != nil && msg.taskID == m.task.ID {
+			m.relatedTasksLoading = false
+			m.relatedTasksLoaded = true
+			if msg.err == nil {
+				m.relatedTasks = msg.results
+			}
+			m.setViewportContent()
+		}
+		return m, nil
+
+	case panesRefreshMsg:
+		// Panes need to be refreshed (e.g., after dangerous mode toggle recreated the window)
+		log := GetLogger()
+		log.Info("panesRefreshMsg: refreshing panes for task %d", m.task.ID)
+		// Re-start the async pane setup
+		return m, m.startPanesAsync()
+	}
+
+	// Pass all messages to viewport for scrolling support
+	// This enables:
+	// - Page Up/Page Down for keyboard scrolling
+	// - Mouse wheel scrolling (tea.MouseMsg)
+	// Note: Up/Down arrow keys are handled by app.go for task navigation
+	m.viewport, cmd = m.viewport.Update(msg)
+
+	return m, cmd
+}
+
+// Pane workers are registered before the command is launched. A closing view
+// can wait for every outstanding operation, even if a command has not started.
+type detailPaneResultMsg struct {
+	owner  *DetailModel
+	result tea.Msg
+}
+
+func (m *DetailModel) paneCommand(work tea.Cmd) tea.Cmd {
+	m.paneWork.Add(1)
+	return func() tea.Msg {
+		defer m.paneWork.Done()
+		return detailPaneResultMsg{owner: m, result: work()}
+	}
+}
+
+// resetBoardPaneStyle clears detail presentation even when no local panes were joined.
+// Target the actual TUI pane: it need not be pane zero or in the current window.
+func (m *DetailModel) resetBoardPaneStyle() {
+	paneID := m.titlePaneID()
+	if os.Getenv("TMUX") == "" || paneID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	runTmuxBatch(ctx, [][]string{
+		{"set-option", "-t", paneID, "status-right", " "},
+		{"set-option", "-t", paneID, "pane-border-lines", "single"},
+		{"set-option", "-t", paneID, "pane-border-indicators", "off"},
+		{"set-option", "-t", paneID, "pane-border-style", "fg=#374151"},
+		{"set-option", "-t", paneID, "pane-active-border-style", "fg=#61AFEF"},
+		{"set-option", "-t", paneID, "window-style", "default"},
+		{"set-option", "-t", paneID, "window-active-style", "default"},
+		{"unbind-key", "-T", "root", "S-Down"},
+		{"unbind-key", "-T", "root", "S-Right"},
+		{"unbind-key", "-T", "root", "S-Up"},
+		{"unbind-key", "-T", "root", "S-Left"},
+		{"unbind-key", "-T", "root", "M-S-Up"},
+		{"unbind-key", "-T", "root", "M-S-Down"},
+		{"select-pane", "-t", paneID, "-T", "Tasks"},
+	})
+}
+
+// Cleanup should be called when leaving detail view. It saves the layout as
+// the new default and closes the view; the task's panes stay in the daemon.
+func (m *DetailModel) Cleanup() {
+	defer m.resetBoardPaneStyle()
+	m.closeRemotePane(true)
+	m.closeTaskWindowView(true)
+}
+
+// CleanupWithoutSaving cleans up panes without saving the height.
+// Use this during task transitions (prev/next) to avoid rounding errors
+// that accumulate with each transition and cause the pane to shrink.
+func (m *DetailModel) CleanupWithoutSaving() {
+	defer m.resetBoardPaneStyle()
+	m.closeRemotePane(true)
+	m.closeTaskWindowView(false)
+}
+
+// ClearPaneState clears the cached pane state without breaking panes.
+// Use this when the tmux window has been recreated externally (e.g., dangerous mode toggle).
+func (m *DetailModel) ClearPaneState() {
+	m.closeRemotePane(false)
+	m.closeTaskWindowView(false)
+	m.claudePaneID = ""
+	m.workdirPaneID = ""
+	m.daemonSessionID = ""
+	m.cachedWindowTarget = ""
+	m.joinPaneFailedUntil = time.Time{}
+}
+
+// PaneSetupHalted returns the reason pane setup stopped and is not retrying, or
+// "" when the view is operating normally.
+func (m *DetailModel) PaneSetupHalted() string { return m.paneSetupHalted }
+
+// SessionClosed reports whether a blocked task's session closed while this view
+// was open — usually the idle sweep — which is when enter resumes it.
+func (m *DetailModel) SessionClosed() bool {
+	return m.paneNotice == sessionClosedNotice && m.task != nil && m.task.Status == db.StatusBlocked
+}
+
+// ResumeSession relaunches the closed session (with --resume) and joins its
+// panes, as reopening the task would. The caller restarts the idle clock so the
+// sweep does not suspend it again a minute later.
+func (m *DetailModel) ResumeSession() tea.Cmd {
+	m.paneNotice = ""
+	m.ClearPaneState()
+	m.paneLoading, m.waitingForExecutor = true, false
+	m.paneLoadingStart = time.Now()
+	m.setViewportContent()
+	return m.startPanesAsync()
+}
+
+// WorktreeMissing reports whether this view is halted because the task's
+// recorded worktree is gone — the one halt with a one-key recovery.
+func (m *DetailModel) WorktreeMissing() bool {
+	_, missing := taskWorktreeMissing(m.task)
+	return missing
+}
+
+// ClearPaneHalt lifts a halt after the user has fixed what caused it, and lets
+// the task spawn again. Only user recovery calls this: nothing in the automatic
+// paths may clear a halt, or the loop comes back.
+func (m *DetailModel) ClearPaneHalt() {
+	m.paneSetupHalted = ""
+	m.paneAdoptRejected = false
+	m.paneError = ""
+	if m.task != nil {
+		executorSpawns.reset(m.task.ID)
+	}
+}
+
+// RefreshPanesCmd returns a command to refresh the tmux panes.
+// Use this after ClearPaneState() to rejoin panes to a recreated window.
+func (m *DetailModel) RefreshPanesCmd() tea.Cmd {
+	return m.paneCommand(func() tea.Msg {
+		// Small delay to allow the new tmux window to be created
+		time.Sleep(300 * time.Millisecond)
+		return panesRefreshMsg{}
+	})
+}
+
+// panesRefreshMsg triggers a pane refresh in the detail view.
+type panesRefreshMsg struct{}
+
+// InFeedbackMode returns false - use tmux pane for interaction.
+func (m *DetailModel) InFeedbackMode() bool {
+	return false
+}
+
+// StartTmuxTicker is no longer needed - real tmux pane handles display.
+func (m *DetailModel) StartTmuxTicker() tea.Cmd {
+	return nil
+}
+
+// findTaskWindow searches tmux sessions for a window matching this task.
+// Returns the full window target (window ID like @1234, or session:window_index) or empty string if not found.
+// Priority order:
+// 1. Stored window ID (most reliable - globally unique)
+// 2. Search by name in stored daemon session
+// 3. Fall back to searching all sessions
+func (m *DetailModel) findTaskWindow() string {
+	log := GetLogger()
+	if m.task == nil {
+		log.Debug("findTaskWindow: task is nil, returning empty")
+		return ""
+	}
+	windowName := executor.TmuxWindowName(m.task.ID)
+	log.Debug("findTaskWindow: looking for window %q for task %d (stored ID: %q)", windowName, m.task.ID, m.task.TmuxWindowID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Search all daemon sessions for the task window
+	// Always return "session:windowID" format for consistency
+	log.Debug("findTaskWindow: searching all sessions")
+	out, err := agentTmux(ctx, "list-windows", "-a", "-F", "#{session_name}:#{window_id}:#{window_name}").Output()
+	if err != nil {
+		log.Error("findTaskWindow: list-windows -a failed: %v", err)
+		return ""
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		sessionName, windowID, name := parts[0], parts[1], parts[2]
+
+		// Only look in daemon sessions
+		if !strings.HasPrefix(sessionName, "task-daemon-") {
+			continue
+		}
+
+		if name == windowName {
+			// Store the window ID for future use
+			if m.database != nil && windowID != "" {
+				m.database.UpdateTaskWindowID(m.task.ID, windowID)
+				m.task.TmuxWindowID = windowID
+			}
+			result := sessionName + ":" + windowID
+			log.Info("findTaskWindow: found -> %q", result)
+			return result
+		}
+	}
+	log.Info("findTaskWindow: window not found for task %d", m.task.ID)
+	return ""
+}
+
+// windowHasLiveExecutor reports whether the given daemon task window currently
+// holds a live executor pane. A window with only its `tail` placeholder and/or a
+// shell is a stale leftover whose executor exited; it should be rebuilt rather
+// than rejoined (see liveExecutorInPaneCommands). If the window can't be inspected
+// we assume it is live and let the normal join path surface any error — we never
+// destroy a window we failed to look at.
+func (m *DetailModel) windowHasLiveExecutor(windowTarget string) bool {
+	if windowTarget == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := agentTmux(ctx, "list-panes", "-t", windowTarget, "-F",
+		"#{pane_dead}\t#{"+executor.SpawnedAtOption+"}\t#{pane_current_command}\t#{pane_start_command}").Output()
+	if err != nil {
+		GetLogger().Debug("windowHasLiveExecutor: list-panes failed for %q: %v (assuming live)", windowTarget, err)
+		return true
+	}
+	return liveExecutorInPanes(strings.Split(strings.TrimSpace(string(out)), "\n"), time.Now())
+}
+
+// spawnGrace is how long a window EnsureTaskWindow created is treated as live
+// no matter what its panes report: the agent is still starting inside `sh -c`.
+const spawnGrace = time.Minute
+
+// liveExecutorInPanes reports whether a task window holds a live executor.
+// Each line is pane_dead, the window's spawned-at time, pane_current_command
+// and pane_start_command, tab-separated.
+//
+// The current command alone is not enough. ty launches the agent as
+// `sh -c <script>`, so for its first moments a healthy pane reports `sh`, and a
+// second TUI opening the task in that moment took it for a corpse and killed it.
+// The first TUI then did the same to the replacement, and the two relaunched
+// task 5436 nineteen times. A pane ty launched that way lives exactly as long as
+// its agent (the script ends when the agent does), so a pane that is not dead
+// and was started by `sh -c` is live whatever it is running right now.
+func liveExecutorInPanes(lines []string, now time.Time) bool {
+	var cmds []string
+	for _, line := range lines {
+		f := strings.SplitN(line, "\t", 4)
+		if len(f) != 4 {
+			continue
+		}
+		dead, spawnedAt, current, start := f[0], f[1], f[2], strings.TrimSpace(f[3])
+		if dead == "1" {
+			continue
+		}
+		if at, err := strconv.ParseInt(spawnedAt, 10, 64); err == nil && now.Sub(time.Unix(at, 0)) < spawnGrace {
+			return true
+		}
+		if strings.HasPrefix(start, "sh -c ") {
+			return true
+		}
+		cmds = append(cmds, current)
+	}
+	return liveExecutorInPaneCommands(cmds)
+}
+
+// killStaleWindow removes a daemon task window that no longer has a live executor
+// pane so the caller can recreate it cleanly, and reports whether it did.
+//
+// Killing is the one destructive step in opening a task, and every ty that has
+// the task open reaches it. It is decided under the same per-task lock every
+// launch takes, and the window is looked at again once the lock is held: a
+// launch that finished while we waited has made the window live. If the lock
+// can't be had, the window is left alone.
+func (m *DetailModel) killStaleWindow(windowTarget string) bool {
+	if windowTarget == "" || m.task == nil {
+		return false
+	}
+	release, err := executorlock.AcquireSpawn(executor.SpawnLockDir(), m.task.ID, 5*time.Second)
+	if err != nil {
+		GetLogger().Warn("killStaleWindow: task %d: %v; leaving %q alone", m.task.ID, err, windowTarget)
+		return false
+	}
+	defer release()
+	if m.windowHasLiveExecutor(windowTarget) {
+		GetLogger().Info("killStaleWindow: %q came alive while waiting for the lock; keeping it", windowTarget)
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	agentTmux(ctx, "kill-window", "-t", windowTarget).Run()
+	if m.database != nil {
+		m.database.UpdateTaskWindowID(m.task.ID, "")
+		m.task.TmuxWindowID = ""
+	}
+	return true
+}
+
+// startResumableSession starts a new tmux window with the task's executor.
+// This reconnects to a session that was previously running but whose tmux window was killed.
+func (m *DetailModel) startResumableSession(sessionID string, handoffContext ...string) error {
+	log := GetLogger()
+	log.Info("startResumableSession: called with sessionID=%q for task %d", sessionID, m.task.ID)
+
+	if m.task == nil {
+		log.Debug("startResumableSession: early return (task is nil)")
+		return fmt.Errorf("task not available")
+	}
+
+	// Two guards stand between this view and an unbounded stream of agents, and
+	// both belong here because this is the single funnel every UI start path goes
+	// through (open, "start session", executor switch).
+	//
+	// 1. A worktree that is recorded but gone. tmux would start the agent in $HOME
+	//    rather than fail, and the pane it produced could never be adopted.
+	if path, missing := taskWorktreeMissing(m.task); missing {
+		log.Error("startResumableSession: task %d records worktree %q, which is not on disk; refusing to start", m.task.ID, path)
+		return fmt.Errorf("%w: %s", executor.ErrWorktreeMissing, path)
+	}
+	// 2. A task that keeps launching executors without ever adopting a pane.
+	if !executorSpawns.allow(m.task.ID, time.Now()) {
+		log.Error("startResumableSession: spawn breaker tripped for task %d; refusing to start another executor", m.task.ID)
+		return errExecutorSpawnLoop
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	handoff := ""
+	if len(handoffContext) > 0 {
+		handoff = handoffContext[0]
+	}
+
+	// The bootstrap logic (find-or-create daemon session, build executor
+	// command, create window + shell pane) is shared with the HTTP API.
+	target, created, err := m.executor.EnsureTaskWindow(ctx, m.task, sessionID, handoff)
+	if err != nil {
+		log.Error("startResumableSession: %v", err)
+		return err
+	}
+	if !created {
+		// Window already exists - cache its session:index target for joins.
+		m.cachedWindowTarget = target
+		log.Info("startResumableSession: window already exists at %q, reusing", target)
+	}
+	log.Info("startResumableSession: completed for task %d", m.task.ID)
+	return nil
+}
+
+// hasActiveTmuxSession checks if this task has an active tmux window in any task-daemon session.
+// Uses cached value for performance (set on creation, cleared on kill).
+func (m *DetailModel) hasActiveTmuxSession() bool {
+	return m.cachedWindowTarget != ""
+}
+
+// paneJoinBlockedByLoad reports whether ensureTmuxPanesJoined should stay out of
+// the way because another code path is actively setting up the panes.
+//
+// paneLoading is set both during active async setup (startPanesAsync /
+// restartForExecutorSwitch, which start a session in a goroutine and report back
+// via panesJoinedMsg) and while passively waiting for the daemon's executor to
+// create the window (a freshly created+queued task with no worktree yet). In the
+// passive case (waitingForExecutor) we must keep polling so the executor pane
+// shows up automatically — otherwise it only appears after leaving and re-entering
+// the detail view.
+func (m *DetailModel) paneJoinBlockedByLoad() bool {
+	return m.paneLoading && !m.waitingForExecutor
+}
+
+// Probe a private snapshot; joining still runs as tracked pane work so cleanup
+// can wait for it. No tmux command executes while scheduling or applying a probe.
+type paneHealthMsg struct {
+	claudePaneID, remotePaneID, viewerPaneID string
+	alive, hasWindow, viewerAlive            bool
+	// task is the database's copy, read when the task's window is gone, so what
+	// happens next is decided from the status the task has now.
+	task *db.Task
+}
+
+func (m *DetailModel) paneHealthCmd() tea.Cmd {
+	if os.Getenv("TMUX") == "" || m.task == nil || m.paneHealthInFlight || m.paneJoinBlockedByLoad() || time.Now().Before(m.joinPaneFailedUntil) {
+		return nil
+	}
+	// While a halt stands, the poll is the thing that would restart the loop: it
+	// sees no pane, finds the window the last doomed launch left behind, and calls
+	// pane setup again. Leave the halted view alone until the user acts.
+	if m.paneSetupHalted != "" {
+		return nil
+	}
+	m.paneHealthInFlight = true
+	task := *m.task
+	worker := &DetailModel{task: &task}
+	database := m.database
+	result := paneHealthMsg{claudePaneID: m.claudePaneID, remotePaneID: m.remotePaneID, viewerPaneID: m.viewerPaneID}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if task.PlacementTarget != "" {
+			// A remote task is shown by a UI pane holding an ssh client.
+			result.alive = paneExists(ctx, uiTmux, result.remotePaneID)
+			return detailPaneResultMsg{owner: m, result: result}
+		}
+		result.alive = paneExists(ctx, agentTmux, result.claudePaneID)
+		result.viewerAlive = paneExists(ctx, uiTmux, result.viewerPaneID)
+		if !result.alive {
+			result.hasWindow = worker.findTaskWindow() != ""
+		}
+		if !result.alive && !result.hasWindow && result.claudePaneID != "" && database != nil {
+			if fresh, err := database.GetTask(task.ID); err == nil && fresh != nil {
+				result.task = fresh
+			}
+		}
+		return detailPaneResultMsg{owner: m, result: result}
+	}
+}
+
+func (m *DetailModel) applyPaneHealth(msg paneHealthMsg) tea.Cmd {
+	m.paneHealthInFlight = false
+	if m.claudePaneID != msg.claudePaneID || m.remotePaneID != msg.remotePaneID ||
+		m.viewerPaneID != msg.viewerPaneID || m.paneJoinBlockedByLoad() {
+		return nil
+	}
+	if m.task.PlacementTarget != "" {
+		if !msg.alive {
+			m.remotePaneID = ""
+		}
+		return nil
+	}
+	if msg.alive && (msg.viewerAlive || m.viewerPaneID == "") {
+		return nil
+	}
+	// The agent died, or its view did: when the task's window closes, the view
+	// ends itself rather than drift to another task's window. Set up again; the
+	// new view replaces whatever is left of the old one (removeStaleViewers).
+	m.claudePaneID, m.workdirPaneID = "", ""
+	m.viewerPaneID, m.viewSession = "", ""
+	// This is the one place the view is declared gone without
+	// closeTaskWindowView running, and the paths below may never build another
+	// one (a blocked or finished task gets no view). Say so on the TUI pane too,
+	// or Shift+arrow keeps aiming at the view that just died.
+	m.clearViewPairingAsync()
+	if msg.alive || msg.hasWindow {
+		m.paneLoading, m.waitingForExecutor = true, false
+		return m.setupPanesAsync()
+	}
+	// The task's window closed while it was on screen: its agent was killed, the
+	// tmux server went away, or the daemon suspended or replaced the executor.
+	// What happens next goes by the status the task has now. A task the database
+	// did not return (deleted) gets nothing.
+	if msg.claudePaneID != "" && msg.task != nil && msg.task.ID == m.task.ID {
+		m.task = msg.task
+		return m.afterWindowClosed()
+	}
+	// hasWorktree means "there is an isolated directory to start in", so a
+	// recorded-but-reaped path must not qualify: starting there is precisely what
+	// tmux turns into a run from $HOME.
+	_, worktreeGone := taskWorktreeMissing(m.task)
+	if shouldFallBackToStart(m.waitingForExecutor, false, m.task.WorktreePath != "" && !worktreeGone, time.Since(m.paneLoadingStart), waitForExecutorTimeout) {
+		m.waitingForExecutor = false
+		return m.startPanesAsync()
+	}
+	return nil
+}
+
+// sessionClosedNotice is what a blocked task's view says once its session has
+// closed under it.
+const sessionClosedNotice = "Session closed (suspended or ended). Press enter to resume it."
+
+// afterWindowClosed decides what the view does once the task's window has
+// closed under it, from the task's current status.
+//
+//   - Queued or processing: the task should be running. Set up again as
+//     opening it does: wait for the daemon's executor, then start one. The
+//     wait starts over, so ty never races the daemon.
+//   - Blocked: most often the idle sweep suspended it to reclaim its memory.
+//     Starting it here would undo that, and the sweep would suspend it again
+//     on its next pass, a minute later, for as long as the task stayed open.
+//     Say so instead; reopening the task resumes it.
+//   - Backlog, done, archived: nothing runs for these when opened either.
+//
+// If the window comes back (ty retry, a reopen in another TUI), the next health
+// check joins it.
+func (m *DetailModel) afterWindowClosed() tea.Cmd {
+	switch m.task.Status {
+	case db.StatusQueued, db.StatusProcessing:
+		m.paneLoading, m.waitingForExecutor = true, false
+		m.paneLoadingStart = time.Now()
+		return m.setupPanesAsync()
+	case db.StatusBlocked:
+		m.paneNotice = sessionClosedNotice
+	}
+	m.paneLoading, m.waitingForExecutor = false, false
+	m.setViewportContent()
+	return nil
+}
+
+// getPaneTitle returns the title for the detail pane (e.g., "Task 123: some task title (2/5)").
+// We don't truncate the title - tmux will handle truncation based on pane width.
+func (m *DetailModel) getPaneTitle() string {
+	if m.task == nil {
+		return "Task"
+	}
+
+	// Build position suffix if available
+	positionSuffix := ""
+	if m.positionInColumn > 0 && m.totalInColumn > 0 {
+		positionSuffix = fmt.Sprintf(" (%d/%d)", m.positionInColumn, m.totalInColumn)
+	}
+
+	prefix := fmt.Sprintf("Task %d", m.task.ID)
+	if m.task.Title == "" {
+		return prefix + positionSuffix
+	}
+
+	taskTitle := m.task.Title
+	// Replace newlines with spaces for single-line display
+	taskTitle = strings.ReplaceAll(taskTitle, "\n", " ")
+	taskTitle = strings.ReplaceAll(taskTitle, "\r", "")
+
+	return fmt.Sprintf("%s: %s%s", prefix, taskTitle, positionSuffix)
+}
+
+// updateTmuxPaneTitle updates the tmux pane title to show task info.
+//
+// m.tuiPaneID is only filled in by a successful pane join or remote attach, and
+// switching tasks builds a fresh DetailModel — so on every switch this ran with
+// an empty id and returned without doing anything, leaving the pane border
+// advertising the PREVIOUS task. A task whose panes never arrive (placed on a
+// host whose session has ended, say) never corrected it, so the border named one
+// task while the body showed another.
+//
+// $TMUX_PANE is the pane this process is running in, by definition. It needs no
+// tmux round trip and cannot name somebody else's pane the way asking tmux for
+// the "current" one can.
+func (m *DetailModel) updateTmuxPaneTitle() {
+	if os.Getenv("TMUX") == "" {
+		return
+	}
+	paneID := m.titlePaneID()
+	if paneID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	uiTmux(ctx, "select-pane", "-t", paneID, "-T", m.getPaneTitle()).Run()
+}
+
+// ownPaneID is the pane this ty process draws into. $TMUX_PANE is set by tmux
+// for the process it runs, so it names this instance's pane by definition.
+//
+// Asking tmux for "#{pane_id}" without a target answers with the active pane of
+// whichever client tmux currently considers foremost. With a second ty attached
+// to the same server that is somebody else's pane — and callers here go on to
+// kill the panes around the answer and split into it, so a wrong answer destroys
+// another instance's executor panes.
+func ownPaneID() string {
+	return os.Getenv("TMUX_PANE")
+}
+
+// ownSessionName resolves the session holding this process's own pane. Scoped to
+// ownPaneID for the same reason: an unscoped query names the foremost client's
+// session, which is how one instance ends up operating inside another's.
+func ownSessionName(ctx context.Context) string {
+	if pane := ownPaneID(); pane != "" {
+		if out, err := uiTmux(ctx, "display-message",
+			"-t", pane, "-p", "#{session_name}").Output(); err == nil {
+			if name := strings.TrimSpace(string(out)); name != "" {
+				return name
+			}
+		}
+	}
+	return "task-ui"
+}
+
+// titlePaneID is the pane whose border title names the task on screen: the one
+// the join/attach path found, or failing that the pane this process runs in.
+func (m *DetailModel) titlePaneID() string {
+	if m.tuiPaneID != "" {
+		return m.tuiPaneID
+	}
+	return os.Getenv("TMUX_PANE")
+}
+
+// getDetailPaneHeight returns the configured detail pane height percentage.
+// Default is 20% for better visibility of task details.
+func (m *DetailModel) getDetailPaneHeight() string {
+	heightStr, err := m.database.GetSetting(config.SettingDetailPaneHeight)
+	if err != nil || heightStr == "" {
+		return "20%"
+	}
+	// Validate the height is a valid percentage (1-50%)
+	if strings.HasSuffix(heightStr, "%") {
+		percentStr := strings.TrimSuffix(heightStr, "%")
+		if percent, err := strconv.Atoi(percentStr); err == nil && percent >= 1 && percent <= 50 {
+			return heightStr
+		}
+	}
+	return "20%"
+}
+
+// Shell pane width bounds. tmux keeps both panes usable inside them, and a
+// width outside the range is treated as absent rather than clamped.
+const (
+	minShellPaneWidth = 10
+	maxShellPaneWidth = 90
+	// defaultShellPaneWidth splits the agent and shell panes evenly.
+	defaultShellPaneWidth = "50%"
+)
+
+// parseShellPaneWidth reads a stored "NN%" width, reporting whether it is a
+// usable percentage.
+func parseShellPaneWidth(widthStr string) (int, bool) {
+	widthStr = strings.TrimSpace(widthStr)
+	if !strings.HasSuffix(widthStr, "%") {
+		return 0, false
+	}
+	percent, err := strconv.Atoi(strings.TrimSuffix(widthStr, "%"))
+	if err != nil || percent < minShellPaneWidth || percent > maxShellPaneWidth {
+		return 0, false
+	}
+	return percent, true
+}
+
+// getShellPaneWidth returns this task's shell pane width percentage. Widths are
+// per task, so each task reopens at the split its own last resize left it at;
+// the global setting is only the fallback for a task that has never been
+// resized, and the even split is the fallback for that.
+func (m *DetailModel) getShellPaneWidth() string {
+	if m.database == nil {
+		return defaultShellPaneWidth
+	}
+	keys := []string{config.SettingShellPaneWidth}
+	if m.task != nil {
+		keys = append([]string{config.ShellPaneWidthKey(m.task.ID)}, keys...)
+	}
+	for _, key := range keys {
+		widthStr, err := m.database.GetSetting(key)
+		if err != nil || widthStr == "" {
+			continue
+		}
+		if percent, ok := parseShellPaneWidth(widthStr); ok {
+			return fmt.Sprintf("%d%%", percent)
+		}
+	}
+	return defaultShellPaneWidth
+}
+
+// getCurrentDetailPaneHeight returns the current detail pane height as a percentage (0-100).
+// Returns 0 on error.
+func (m *DetailModel) getCurrentDetailPaneHeight(tuiPaneID string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Get the current height of the TUI pane
+	cmd := uiTmux(ctx, "display-message", "-p", "-t", tuiPaneID, "#{pane_height}")
+	heightOut, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+
+	paneHeight, err := strconv.Atoi(strings.TrimSpace(string(heightOut)))
+	if err != nil || paneHeight <= 0 {
+		return 0
+	}
+
+	// Get the total window height
+	cmd = uiTmux(ctx, "display-message",
+		"-t", m.titlePaneID(), "-p", "#{window_height}")
+	totalHeightOut, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+
+	totalHeight, err := strconv.Atoi(strings.TrimSpace(string(totalHeightOut)))
+	if err != nil || totalHeight <= 0 {
+		return 0
+	}
+
+	// Calculate the percentage with proper rounding to avoid truncation errors
+	// that cause the pane to progressively shrink over time
+	return (paneHeight*100 + totalHeight/2) / totalHeight
+}
+
+// getActualPaneHeight returns the actual pane height in lines.
+// Returns 0 on error.
+func (m *DetailModel) getActualPaneHeight(tuiPaneID string) int {
+	if tuiPaneID == "" {
+		return 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Get the current height of the TUI pane in lines
+	cmd := uiTmux(ctx, "display-message", "-p", "-t", tuiPaneID, "#{pane_height}")
+	heightOut, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+
+	paneHeight, err := strconv.Atoi(strings.TrimSpace(string(heightOut)))
+	if err != nil || paneHeight <= 0 {
+		return 0
+	}
+
+	return paneHeight
+}
+
+// tmuxPaneOpMu serializes pane join/break operations across the whole process.
+//
+// join/break run a multi-step tmux sequence that mutates and reads global tmux
+// server state (the "current window", the set of panes in task-ui, the active
+// pane). Two of these interleaving — e.g. rapid task switching fires one task's
+// join concurrently with another's — corrupts that shared state: one join's
+// "kill leftover panes in task-ui" step can kill a pane a concurrent join just
+// moved in, and (before the source-id fix below) a `display-message` read of the
+// active pane could return the *other* task's pane. That is exactly how tasks
+// 4324 and 4822 ended up sharing pane %812. Serializing makes each sequence
+// atomic with respect to the others.
+var tmuxPaneOpMu sync.Mutex
+
+// paneCwdInWorktree reports whether the given tmux pane's current working
+// directory lives inside the task's worktree. It is the ownership check that
+// prevents a task from adopting another task's executor pane when a stored
+// pane ID is stale or has been reused by tmux for a different pane.
+//
+// Returns true when ownership can't be determined (no worktree recorded, or the
+// query fails) so we never reject a legitimate pane on a transient error — the
+// check only ever *rejects* on a definite worktree mismatch.
+func (m *DetailModel) paneCwdInWorktree(ctx context.Context, paneID string) bool {
+	if m.task == nil || m.task.WorktreePath == "" || paneID == "" {
+		return true
+	}
+	out, err := agentTmux(ctx, "display-message",
+		"-t", paneID, "-p", "#{pane_current_path}").Output()
+	if err != nil {
+		return true // can't tell — don't reject
+	}
+	cwd := strings.TrimSpace(string(out))
+	if cwd == "" {
+		return true
+	}
+	return pathInsideDir(m.task.WorktreePath, cwd)
+}
+
+// pathInsideDir reports whether path is dir itself or nested within it, after
+// resolving symlinks on both sides so /tmp vs /private/tmp (and similar macOS
+// symlinked prefixes) don't produce false mismatches. Returns true when the
+// comparison can't be made, so callers only ever act on a definite mismatch.
+func pathInsideDir(dir, path string) bool {
+	if dir == "" || path == "" {
+		return true
+	}
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return true // unrelated volumes / can't compare — don't reject
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
+}
+
+// ToggleShellPane toggles the visibility of the shell pane.
+// When hidden, the shell pane is moved to the daemon window and Claude expands to full width.
+// When shown, the shell pane is rejoined from the daemon or a new one is created.
+func (m *DetailModel) ToggleShellPane() tea.Cmd {
+	if loc, remote := m.remoteTaskLocation(); remote {
+		if m.paneLoading {
+			return nil
+		}
+		m.paneLoading = true
+		return tea.Batch(m.spinnerTick(), m.paneCommand(func() tea.Msg {
+			err := m.toggleRemoteShellPane(loc)
+			return remoteShellToggledMsg{err: err, hidden: m.remoteShellPaneID == ""}
+		}))
+	}
+	log := GetLogger()
+	log.Info("ToggleShellPane: shellPaneHidden=%v, workdirPaneID=%q, claudePaneID=%q",
+		m.shellPaneHidden, m.workdirPaneID, m.claudePaneID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if m.shellPaneHidden {
+		// Show shell pane - rejoin it from daemon or create new
+		m.showShellPane(ctx)
+	} else {
+		// Hide shell pane - move it to daemon and expand Claude
+		m.hideShellPane(ctx)
+	}
+
+	// Save preference to settings
+	hiddenStr := "false"
+	if m.shellPaneHidden {
+		hiddenStr = "true"
+	}
+	m.database.SetSetting(config.SettingShellPaneHidden, hiddenStr)
+	log.Info("ToggleShellPane: saved shellPaneHidden=%v", m.shellPaneHidden)
+	return nil
+}
+
+// IsShellPaneHidden returns true if the shell pane is currently hidden.
+func (m *DetailModel) IsShellPaneHidden() bool {
+	return m.shellPaneHidden
+}
+
+// getWorkdir returns the working directory for the task.
+func (m *DetailModel) getWorkdir() string {
+	if m.task.WorktreePath != "" {
+		return m.task.WorktreePath
+	}
+	// Try project directory if task has a project
+	if m.task.Project != "" && m.executor != nil {
+		if projectDir := m.executor.GetProjectDir(m.task.Project); projectDir != "" {
+			return projectDir
+		}
+	}
+	// Fallback to home directory
+	home, _ := os.UserHomeDir()
+	return home
+}
+
+// HasRunningShellProcess returns true if the shell pane has a running process.
+// This shells out to tmux, so it must NOT be called from the per-frame render
+// path. Refresh() polls it on a throttle and caches the result in
+// hasRunningShellProc, which renderHeader() reads instead.
+func (m *DetailModel) HasRunningShellProcess() bool {
+	if m.task == nil {
+		return false
+	}
+
+	// Get user's default shell for comparison
+	userShell := os.Getenv("SHELL")
+	if userShell == "" {
+		userShell = "/bin/zsh"
+	}
+	if idx := strings.LastIndex(userShell, "/"); idx >= 0 {
+		userShell = userShell[idx+1:]
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	// Check the shell pane
+	if m.workdirPaneID == "" {
+		return false
+	}
+	paneToCheck := m.workdirPaneID
+
+	// Get the current command in the shell pane
+	out, err := agentTmux(ctx, "display-message", "-t", paneToCheck, "-p", "#{pane_current_command}").Output()
+	if err != nil {
+		return false
+	}
+
+	command := strings.TrimSpace(string(out))
+	return command != "" && command != userShell
+}
+
+// checkServerListening checks if a server is listening on the task's port.
+// Uses lsof to check for listening processes on the port.
+func (m *DetailModel) checkServerListening() {
+	if m.task == nil || m.task.Port == 0 {
+		m.serverListening = false
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	// Use lsof to check if any process is listening on the task's port
+	// -i :PORT checks for processes using that port
+	// -sTCP:LISTEN filters for listening sockets only
+	cmd := osExec.CommandContext(ctx, "lsof", "-i", fmt.Sprintf(":%d", m.task.Port), "-sTCP:LISTEN")
+	err := cmd.Run()
+	// lsof returns exit code 0 if it finds a match, non-zero otherwise
+	m.serverListening = err == nil
+}
+
+// GetServerURL returns the server URL if a server is listening on the task's port.
+func (m *DetailModel) GetServerURL() string {
+	if !m.serverListening || m.task == nil || m.task.Port == 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://localhost:%d", m.task.Port)
+}
+
+// IsFocused returns true if the detail pane is the active tmux pane.
+func (m *DetailModel) IsFocused() bool {
+	return m.focused
+}
+
+type focusStateMsg struct {
+	detail  *DetailModel
+	focused bool
+}
+
+// Capture inputs before launching the command: no mutable model reads in workers.
+func (m *DetailModel) focusStateCmd() tea.Cmd {
+	paneID, inTmux := m.tuiPaneID, os.Getenv("TMUX") != ""
+	return func() tea.Msg {
+		focused := true
+		if inTmux && paneID != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			// Ask about this pane specifically. An unscoped read returns the
+			// foremost client's active pane, so a second ty attached to the same
+			// server made this instance believe it had lost focus.
+			out, err := uiTmux(ctx, "display-message",
+				"-t", paneID, "-p", "#{pane_active}").Output()
+			if err == nil {
+				focused = strings.TrimSpace(string(out)) == "1"
+			}
+		}
+		return focusStateMsg{detail: m, focused: focused}
+	}
+}
+
+// View renders the detail view.
+//
+// View runs on every Bubble Tea update while the detail view is open. The header
+// and help are cheap (~12µs) and have many volatile inputs (spinner frame, PR
+// info, badges, theme colours), so we render them every frame and fold their
+// output into the cache signature — that captures every input they read without
+// having to enumerate each one. The expensive parts — viewport.View() and the
+// bordered box.Render(), together ~2ms and ~2.7MB per call — are skipped entirely
+// when the signature is unchanged.
+func (m *DetailModel) View() string {
+	if !m.ready {
+		return "\n  Loading..."
+	}
+
+	if ComposerEnabled && m.task != nil {
+		if ActivityHook != nil {
+			m.prompt.working, m.prompt.workingFor = ActivityHook(m.task.ID)
+		}
+		if ContextHook != nil {
+			m.prompt.context = ContextHook(m.task.ID)
+		}
+	}
+
+	// Writing a message takes focus away from what is being read, as it does in
+	// the app: the conversation dims so the eye goes to the box. renderHelp is
+	// left alone — it has its own branch for the composer and must stay bright.
+	composing := m.ComposerFocused()
+	wasFocused := m.focused
+	if composing {
+		m.focused = false
+	}
+
+	header := m.renderHeader()
+	if composing {
+		m.focused = wasFocused
+	}
+	help := m.renderHelp()
+	if composing {
+		m.focused = false
+	}
+
+	sig := m.viewSignature(header, help)
+	if composing {
+		sig = hashString(sig, "composing")
+	}
+	if m.prompt.working {
+		// The spinner has to advance, and the cache key knows nothing about
+		// time, so fold the current frame into it.
+		sig = hashString(sig, thinkingFrame()+m.prompt.workingFor)
+	}
+	if m.cachedViewOK && m.cachedViewSig == sig {
+		return m.cachedView
+	}
+
+	// Global dangerous mode banner
+	var dangerBanner string
+	if IsGlobalDangerousMode() {
+		dangerStyle := lipgloss.NewStyle().
+			Background(lipgloss.Color("#E06C75")). // Red background
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Bold(true).
+			Padding(0, 2).
+			Width(m.width)
+		dangerBanner = dangerStyle.Render(IconBlocked() + " DANGEROUS MODE ENABLED")
+	}
+
+	content := m.viewport.View()
+
+	// Use dimmed border when unfocused
+	borderColor := ColorPrimary
+	if !m.focused {
+		borderColor = lipgloss.Color("#4B5563") // Muted gray
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Width(m.width-2).
+		Padding(0, 1)
+
+	// Add scroll indicator if content is scrollable
+	var scrollIndicator string
+	if m.viewport.TotalLineCount() > m.viewport.VisibleLineCount() {
+		scrollPercent := 0
+		if m.viewport.TotalLineCount() > 0 {
+			scrollPercent = int(float64(m.viewport.YOffset+m.viewport.VisibleLineCount()) / float64(m.viewport.TotalLineCount()) * 100)
+			if scrollPercent > 100 {
+				scrollPercent = 100
+			}
+		}
+		indicatorStyle := lipgloss.NewStyle().Foreground(ColorMuted)
+		if !m.focused {
+			indicatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563"))
+		}
+		scrollIndicator = indicatorStyle.Render(fmt.Sprintf(" %d%% ", scrollPercent))
+	}
+
+	boxContent := lipgloss.JoinVertical(lipgloss.Left, header, content)
+	if scrollIndicator != "" {
+		boxContent = lipgloss.JoinVertical(lipgloss.Left, header, content, scrollIndicator)
+	}
+
+	renderedBox := box.Render(boxContent)
+
+	// When shell pane is hidden, show a collapsed indicator on the right
+	if m.shellPaneHidden && os.Getenv("TMUX") != "" {
+		// Create vertical "Shell" label - each character on its own line
+		shellLabel := "S\nh\ne\nl\nl"
+
+		// Style for the collapsed shell tab
+		tabStyle := lipgloss.NewStyle().
+			Background(lipgloss.Color("#3B4252")). // Dark muted background
+			Foreground(lipgloss.Color("#88C0D0")). // Teal text (matches shell theme)
+			Bold(true).
+			Padding(1, 0).
+			Align(lipgloss.Center)
+
+		// Calculate height to match the box
+		boxHeight := lipgloss.Height(renderedBox)
+		shellTab := tabStyle.Height(boxHeight).Render(shellLabel)
+
+		// Join the box and the shell tab horizontally
+		renderedBox = lipgloss.JoinHorizontal(lipgloss.Top, renderedBox, shellTab)
+	}
+
+	// Build view parts
+	var viewParts []string
+	if dangerBanner != "" {
+		viewParts = append(viewParts, dangerBanner)
+	}
+	if ComposerEnabled {
+		if m.AwayFromBottom() {
+			chip := lipgloss.NewStyle().
+				Foreground(ColorPrimary).
+				Bold(true).
+				Render("  ctrl+l")
+			hint := lipgloss.NewStyle().Foreground(ColorMuted).
+				Render("  jump to latest")
+			viewParts = append(viewParts, renderedBox, chip+hint, m.prompt.render(m.width), help)
+		} else {
+			viewParts = append(viewParts, renderedBox, m.prompt.render(m.width), help)
+		}
+	} else {
+		viewParts = append(viewParts, renderedBox, help)
+	}
+
+	out := lipgloss.JoinVertical(lipgloss.Left, viewParts...)
+
+	m.focused = wasFocused
+	m.cachedView = out
+	m.cachedViewSig = sig
+	m.cachedViewOK = true
+	return out
+}
+
+// viewSignature folds every input to View() into an allocation-free FNV-1a
+// signature. The header and help strings are passed in already rendered: hashing
+// their bytes captures all of their inputs (badges, spinner frame, PR info, theme
+// colours) without enumerating each one. The remaining inputs are the View-level
+// state the header/help don't cover: the dangerous-mode banner, the bordered box,
+// and the viewport's content/scroll geometry.
+func (m *DetailModel) viewSignature(header, help string) uint64 {
+	h := newSigHasher()
+	h.u64(StyleGeneration()) // theme / project colour changes
+	h.int(m.width)
+	h.int(m.height)
+	h.boolean(m.focused)
+	h.boolean(IsGlobalDangerousMode())
+	h.boolean(m.shellPaneHidden)
+	h.boolean(os.Getenv("TMUX") != "")
+	// Viewport content + scroll geometry (viewport.View() output is fully
+	// determined by these); the version bumps whenever the body is re-set.
+	h.u64(m.viewportContentVersion)
+	h.int(m.viewport.YOffset)
+	h.int(m.viewport.Width)
+	h.int(m.viewport.Height)
+	h.int(m.viewport.TotalLineCount())
+	h.int(m.viewport.VisibleLineCount())
+	h.str(header)
+	h.str(help)
+	return h.h
+}
+
+// setViewportContent re-renders the task content into the viewport and bumps the
+// content version so the View render cache knows the body changed. All viewport
+// content updates must go through here, or the cache could serve a stale body.
+var errNoRenderer = errors.New("no markdown renderer")
+
+func (m *DetailModel) setViewportContent() {
+	content := m.renderContent()
+	m.viewport.SetContent(content)
+	m.viewportContentVersion++
+
+	// A conversation is read from the newest message back, so the pane opens at
+	// the bottom and stays there as the thread grows — unless the reader has
+	// scrolled up, in which case their position is theirs to keep.
+	if ConversationView && m.stickyBottom {
+		m.viewport.GotoBottom()
+	}
+}
+
+// syncStickyBottom re-arms follow-the-newest once the reader returns to the end,
+// and disarms it the moment they scroll away.
+func (m *DetailModel) syncStickyBottom() {
+	if !ConversationView {
+		return
+	}
+	m.stickyBottom = m.viewport.AtBottom()
+}
+
+func (m *DetailModel) renderHeader() string {
+	t := m.task
+
+	// When unfocused, use muted styles for badges
+	dimmedBg := lipgloss.Color("#4B5563")     // Muted gray background
+	dimmedFg := lipgloss.Color("#9CA3AF")     // Muted gray foreground
+	dimmedTextFg := lipgloss.Color("#6B7280") // Even more muted for text
+
+	// Task title is shown in the tmux pane border, so we don't duplicate it here
+
+	var meta strings.Builder
+
+	// Status badge
+	var statusStyle lipgloss.Style
+	if m.focused {
+		statusStyle = lipgloss.NewStyle().
+			Padding(0, 1).
+			Background(StatusColor(t.Status)).
+			Foreground(lipgloss.Color("#FFFFFF"))
+	} else {
+		statusStyle = lipgloss.NewStyle().
+			Padding(0, 1).
+			Background(dimmedBg).
+			Foreground(dimmedFg)
+	}
+	meta.WriteString(statusStyle.Render(t.Status))
+	meta.WriteString("  ")
+
+	// Dangerous mode badge (only shown when in dangerous mode and task is active)
+	if t.IsDangerous() && (t.Status == db.StatusProcessing || t.Status == db.StatusBlocked) {
+		var dangerousStyle lipgloss.Style
+		if m.focused {
+			dangerousStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(lipgloss.Color("196")). // Red
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Bold(true)
+		} else {
+			dangerousStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(dimmedBg).
+				Foreground(dimmedFg)
+		}
+		meta.WriteString(dangerousStyle.Render("DANGEROUS"))
+		meta.WriteString("  ")
+	}
+
+	// Auto-mode badge (Claude Code's --permission-mode auto) for active tasks.
+	// Yellow to match Claude Code's own "auto mode on" status color.
+	if t.IsAutoPermission() && (t.Status == db.StatusProcessing || t.Status == db.StatusBlocked) {
+		var autoStyle lipgloss.Style
+		if m.focused {
+			autoStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(ColorWarning).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true)
+		} else {
+			autoStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(dimmedBg).
+				Foreground(dimmedFg)
+		}
+		meta.WriteString(autoStyle.Render("AUTO"))
+		meta.WriteString("  ")
+	}
+
+	// Accept-edits badge (Claude's acceptEdits mode) for active tasks. Violet to
+	// match Claude Code's own "accept edits on" status color — and distinct from
+	// AUTO above so the two permission sets are never confused.
+	if t.IsAcceptEdits() && (t.Status == db.StatusProcessing || t.Status == db.StatusBlocked) {
+		var aeStyle lipgloss.Style
+		if m.focused {
+			aeStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(ColorCode).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Bold(true)
+		} else {
+			aeStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(dimmedBg).
+				Foreground(dimmedFg)
+		}
+		meta.WriteString(aeStyle.Render("ACCEPT EDITS"))
+		meta.WriteString("  ")
+	}
+
+	if t.Pinned {
+		var pinStyle lipgloss.Style
+		if m.focused {
+			pinStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(ColorWarning).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true)
+		} else {
+			pinStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(dimmedBg).
+				Foreground(dimmedFg)
+		}
+		meta.WriteString(pinStyle.Render("PINNED"))
+		meta.WriteString("  ")
+	}
+
+	// Project
+	if t.Project != "" {
+		var projectStyle lipgloss.Style
+		if m.focused {
+			projectStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(ProjectColor(t.Project)).
+				Foreground(lipgloss.Color("#FFFFFF"))
+		} else {
+			projectStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(dimmedBg).
+				Foreground(dimmedFg)
+		}
+		meta.WriteString(projectStyle.Render(t.Project))
+		meta.WriteString("  ")
+	}
+
+	// Type
+	if t.Type != "" {
+		var typeStyle lipgloss.Style
+		if m.focused {
+			typeStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(ColorCode).
+				Foreground(lipgloss.Color("#FFFFFF"))
+		} else {
+			typeStyle = lipgloss.NewStyle().
+				Padding(0, 1).
+				Background(dimmedBg).
+				Foreground(dimmedFg)
+		}
+		meta.WriteString(typeStyle.Render(t.Type))
+	}
+
+	// PR status
+	if m.prInfo != nil {
+		meta.WriteString("  ")
+		if m.focused {
+			meta.WriteString(PRStatusBadge(m.prInfo))
+		} else {
+			// Dimmed PR badge - use same icon as focused, just dimmed
+			prBadgeStyle := lipgloss.NewStyle().
+				Padding(0, 0).
+				Background(dimmedBg).
+				Foreground(dimmedFg).
+				Bold(true)
+			meta.WriteString(prBadgeStyle.Render(PRStatusIcon(m.prInfo)))
+		}
+		meta.WriteString(" ")
+		prDesc := lipgloss.NewStyle().
+			Foreground(dimmedTextFg).
+			Render(m.prInfo.StatusDescription())
+		meta.WriteString(prDesc)
+
+		// Diff stats (additions/deletions)
+		var diffStats string
+		if m.focused {
+			diffStats = PRDiffStatsBright(m.prInfo)
+		} else {
+			diffStats = PRDiffStats(m.prInfo)
+		}
+		if diffStats != "" {
+			meta.WriteString("  ")
+			meta.WriteString(diffStats)
+		}
+	}
+
+	// Running process indicator. Reads the cached flag (refreshed on a throttle in
+	// Refresh()) rather than calling HasRunningShellProcess() here — that shells out
+	// to tmux and renderHeader runs on every frame.
+	if m.hasRunningShellProc {
+		meta.WriteString("  ")
+		var processStyle lipgloss.Style
+		if m.focused {
+			processStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("46")) // Bright green
+		} else {
+			processStyle = lipgloss.NewStyle().Foreground(dimmedFg)
+		}
+		meta.WriteString(processStyle.Render("●"))
+	}
+
+	// Pane loading indicator
+	if m.paneLoading {
+		meta.WriteString("  ")
+		elapsed := time.Since(m.paneLoadingStart)
+		frameIndex := int(elapsed.Milliseconds()/100) % len(spinnerFrames)
+		spinner := spinnerFrames[frameIndex]
+		var loadingStyle lipgloss.Style
+		if m.focused {
+			loadingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // Orange
+		} else {
+			loadingStyle = lipgloss.NewStyle().Foreground(dimmedFg)
+		}
+		loadingText := fmt.Sprintf("%s Starting %s...", spinner, m.executorDisplayName())
+		meta.WriteString(loadingStyle.Render(loadingText))
+	}
+
+	// The pane notice and the executor failure are NOT badges. They are prose —
+	// a host, a worktree path, an ssh command to copy, a reason a spawn failed —
+	// and they get their own full-width lines below, built after maxW is known.
+	// Putting them on the meta line meant competing with the badges for a
+	// right-aligned row, where the only outcomes are wrapping (which strands the
+	// tail on a line of its own) or truncating a path away to an ellipsis.
+
+	// PR link if available. These lines are right-aligned, so the URL ends flush
+	// against the pane's padding and border — exactly where a terminal guessing a
+	// link's extent from the screen picks up the border character. linkifyURLs
+	// gives the click an explicit target instead.
+	var prLine string
+	if m.prInfo != nil && m.prInfo.URL != "" {
+		if m.focused {
+			prLine = linkifyURLs(Dim.Render(fmt.Sprintf("PR #%d: %s", m.prInfo.Number, m.prInfo.URL)))
+		} else {
+			prLine = linkifyURLs(lipgloss.NewStyle().Foreground(dimmedTextFg).Render(fmt.Sprintf("PR #%d: %s", m.prInfo.Number, m.prInfo.URL)))
+		}
+	}
+
+	// Server URL if a server is listening on the task's port
+	var serverLine string
+	if serverURL := m.GetServerURL(); serverURL != "" {
+		if m.focused {
+			serverLine = linkifyURLs(Dim.Render(fmt.Sprintf("Server: %s", serverURL)))
+		} else {
+			serverLine = linkifyURLs(lipgloss.NewStyle().Foreground(dimmedTextFg).Render(fmt.Sprintf("Server: %s", serverURL)))
+		}
+	}
+
+	// Build the first line. The meta line is one line by contract: it is
+	// right-aligned as a block below, and lipgloss word-wraps anything wider than
+	// the header, which strands the last few words alone on their own
+	// right-aligned row. Truncate instead — ANSI-aware, so the badges' colour
+	// escapes are not cut in half.
+	metaStr := meta.String()
+	metaWidth := m.width - 4
+	if metaWidth < 1 {
+		metaWidth = 1
+	}
+	if lipgloss.Width(metaStr) > metaWidth {
+		metaStr = ansi.Truncate(metaStr, metaWidth, "…")
+	}
+
+	// Create a block for the right-aligned content
+	rightContent := []string{metaStr}
+	if prLine != "" {
+		rightContent = append(rightContent, prLine)
+	}
+	if serverLine != "" {
+		rightContent = append(rightContent, serverLine)
+	}
+	rightBlock := lipgloss.JoinVertical(lipgloss.Right, rightContent...)
+
+	// Render the block aligned to the right of the available space
+	headerLayout := lipgloss.NewStyle().
+		Width(m.width - 4).
+		Align(lipgloss.Right).
+		Render(rightBlock)
+
+	maxW := m.width - 4
+	if maxW < 8 {
+		maxW = 8
+	}
+
+	lines := []string{headerLayout}
+	if t.PlacementTarget != "" {
+		health := m.hostHealth.State
+		if health == "" {
+			health = "unknown"
+		}
+		line := "Host: " + t.PlacementTarget + " · " + health + " · @ placement"
+		if m.hostHealth.LastSeen != "" {
+			line += " · last seen " + m.hostHealth.LastSeen
+		}
+		lines = append(lines, Dim.Render(truncateRunes(line, maxW)))
+		if t.PlacementReason != "" {
+			lines = append(lines, Dim.Render(truncateRunes(t.PlacementReason, maxW)))
+		}
+	}
+
+	// Where a remotely placed task actually is. Informational, not an error, and
+	// left-aligned on its own line so a worktree path or an ssh command survives
+	// long enough to be read and copied.
+	if m.paneNotice != "" {
+		noticeStyle := lipgloss.NewStyle().Foreground(dimmedFg)
+		if m.focused {
+			noticeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+		}
+		lines = append(lines, noticeStyle.Render(truncateRunes("⇄ "+m.paneNotice, maxW)))
+	}
+
+	// Executor failure. Same treatment: the reason a spawn failed is the whole
+	// value of the line, so it does not go in a badge slot.
+	if m.paneError != "" {
+		errorStyle := lipgloss.NewStyle().Foreground(dimmedFg)
+		if m.focused {
+			errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+		}
+		lines = append(lines, errorStyle.Render(truncateRunes("⚠ "+m.paneError, maxW)))
+	}
+
+	if stand := tasksummary.DisplayStand(t.Summary); stand != "" {
+		standColor := ColorMuted
+		if m.focused && t.Status == db.StatusBlocked {
+			standColor = ColorWarning
+		} else if !m.focused {
+			standColor = dimmedTextFg
+		}
+		lines = append(lines, FgStyle(standColor).Render(truncateRunes(stand, maxW)))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, append(lines, "")...)
+}
+
+// getGlamourRenderer returns a cached Glamour renderer, creating it if needed.
+// Renderers are cached separately for focused and unfocused states.
+func (m *DetailModel) getGlamourRenderer(focused bool) *glamour.TermRenderer {
+	targetWidth := m.width - 4
+
+	// Invalidate cache if width changed
+	if m.glamourWidth != targetWidth {
+		m.glamourRendererFocused = nil
+		m.glamourRendererUnfocused = nil
+		m.glamourWidth = targetWidth
+	}
+
+	if focused {
+		if m.glamourRendererFocused == nil {
+			renderer, err := glamour.NewTermRenderer(
+				glamour.WithStylePath("dark"),
+				glamour.WithWordWrap(targetWidth),
+			)
+			if err == nil {
+				m.glamourRendererFocused = renderer
+			}
+		}
+		return m.glamourRendererFocused
+	}
+
+	if m.glamourRendererUnfocused == nil {
+		renderer, err := glamour.NewTermRenderer(
+			glamour.WithStylePath("notty"),
+			glamour.WithWordWrap(targetWidth),
+		)
+		if err == nil {
+			m.glamourRendererUnfocused = renderer
+		}
+	}
+	return m.glamourRendererUnfocused
+}
+
+// computeLogHash computes a simple hash of the logs for change detection.
+func (m *DetailModel) computeLogHash() uint64 {
+	if len(m.logs) == 0 {
+		return 0
+	}
+	// Use length and last log timestamp as a fast proxy for changes
+	hash := uint64(len(m.logs))
+	if len(m.logs) > 0 {
+		hash ^= uint64(m.logs[len(m.logs)-1].CreatedAt.UnixNano())
+	}
+	return hash
+}
+
+func (m *DetailModel) renderContent() string {
+	t := m.task
+
+	// Check if we can use cached content
+	// Note: We don't cache when related tasks are loading/changing
+	logHash := m.computeLogHash()
+	// The workflow panel reflects sibling step statuses, which change while this
+	// view is open — fold it into the cache key or the flow freezes mid-run.
+	workflowHash := m.workflowStepsHash()
+	if m.cachedContent != "" &&
+		m.lastRenderedBody == t.Body &&
+		m.lastRenderedSummary == t.Summary &&
+		m.lastRenderedLogHash == logHash &&
+		m.lastRenderedFocused == m.focused &&
+		m.lastRenderedWorkflow == workflowHash &&
+		!m.relatedTasksLoading {
+		return m.cachedContent
+	}
+
+	var b strings.Builder
+
+	// Dimmed style for unfocused content
+	dimmedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
+
+	// Description
+	if t.Body != "" && strings.TrimSpace(t.Body) != "" {
+		// Labels always use full opacity for clarity and accessibility
+		b.WriteString(Bold.Render("Description"))
+		b.WriteString("\n\n")
+
+		// Use cached renderer
+		renderer := m.getGlamourRenderer(m.focused)
+		if renderer == nil {
+			if m.focused {
+				b.WriteString(t.Body)
+			} else {
+				b.WriteString(dimmedStyle.Render(t.Body))
+			}
+		} else {
+			rendered, err := renderer.Render(t.Body)
+			if err != nil {
+				if m.focused {
+					b.WriteString(t.Body)
+				} else {
+					b.WriteString(dimmedStyle.Render(t.Body))
+				}
+			} else {
+				if m.focused {
+					b.WriteString(linkifyURLs(strings.TrimSpace(rendered)))
+				} else {
+					b.WriteString(dimmedStyle.Render(linkifyURLs(strings.TrimSpace(rendered))))
+				}
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	// Workflow flow — placed directly under the description so the run's shape and
+	// this step's position in it are visible without scrolling past logs.
+	if flow := m.renderWorkflowFlow(!m.focused); flow != "" {
+		b.WriteString(flow)
+	}
+
+	// Related Tasks section (from QMD semantic search)
+	if m.relatedTasksLoading {
+		b.WriteString("\n")
+		b.WriteString(Bold.Render("Related Tasks"))
+		b.WriteString("\n\n")
+		if m.focused {
+			b.WriteString(Dim.Render("  Searching..."))
+		} else {
+			b.WriteString(dimmedStyle.Render("  Searching..."))
+		}
+		b.WriteString("\n")
+	} else if len(m.relatedTasks) > 0 {
+		b.WriteString("\n")
+		b.WriteString(Bold.Render("Related Tasks"))
+		b.WriteString("\n\n")
+		for _, related := range m.relatedTasks {
+			// Score indicator: high (>0.7), medium (>0.4), low
+			scoreIndicator := "○"
+			if related.Score > 0.7 {
+				scoreIndicator = "●"
+			} else if related.Score > 0.4 {
+				scoreIndicator = "◐"
+			}
+			line := fmt.Sprintf("  %s #%d: %s", scoreIndicator, related.TaskID, related.Title)
+			if m.focused {
+				b.WriteString(line)
+			} else {
+				b.WriteString(dimmedStyle.Render(line))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	// Fossil recaps stay in the body until rewritten. A one-line stand already
+	// lives in the header — don't duplicate it here.
+	if t.Summary != "" && !tasksummary.IsStandLine(t.Summary) {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(Bold.Render("Activity Summary"))
+		b.WriteString("\n\n")
+
+		renderer := m.getGlamourRenderer(m.focused)
+		if renderer == nil {
+			if m.focused {
+				b.WriteString(t.Summary)
+			} else {
+				b.WriteString(dimmedStyle.Render(t.Summary))
+			}
+		} else {
+			rendered, err := renderer.Render(t.Summary)
+			if err != nil {
+				if m.focused {
+					b.WriteString(t.Summary)
+				} else {
+					b.WriteString(dimmedStyle.Render(t.Summary))
+				}
+			} else {
+				if m.focused {
+					b.WriteString(linkifyURLs(strings.TrimSpace(rendered)))
+				} else {
+					b.WriteString(dimmedStyle.Render(linkifyURLs(strings.TrimSpace(rendered))))
+				}
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	// Dependencies section
+	if m.database != nil {
+		blockers, blockedBy, err := m.database.GetAllDependencies(t.ID)
+		if err == nil && (len(blockers) > 0 || len(blockedBy) > 0) {
+			b.WriteString("\n")
+			b.WriteString(Bold.Render("Dependencies"))
+			b.WriteString("\n\n")
+
+			if len(blockers) > 0 {
+				lockStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B"))
+				b.WriteString(lockStyle.Render("Blocked by:"))
+				b.WriteString("\n")
+				for _, blocker := range blockers {
+					statusStr := ""
+					if blocker.Status == db.StatusDone || blocker.Status == db.StatusArchived {
+						statusStr = lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981")).Render(" [done]")
+					} else {
+						statusStr = Dim.Render(fmt.Sprintf(" [%s]", blocker.Status))
+					}
+					if m.focused {
+						b.WriteString(fmt.Sprintf("  #%d: %s%s\n", blocker.ID, blocker.Title, statusStr))
+					} else {
+						b.WriteString(dimmedStyle.Render(fmt.Sprintf("  #%d: %s%s\n", blocker.ID, blocker.Title, statusStr)))
+					}
+				}
+			}
+
+			if len(blockedBy) > 0 {
+				if len(blockers) > 0 {
+					b.WriteString("\n")
+				}
+				b.WriteString(Bold.Render("Blocks:"))
+				b.WriteString("\n")
+				for _, blocked := range blockedBy {
+					statusStr := Dim.Render(fmt.Sprintf(" [%s]", blocked.Status))
+					if m.focused {
+						b.WriteString(fmt.Sprintf("  #%d: %s%s\n", blocked.ID, blocked.Title, statusStr))
+					} else {
+						b.WriteString(dimmedStyle.Render(fmt.Sprintf("  #%d: %s%s\n", blocked.ID, blocked.Title, statusStr)))
+					}
+				}
+			}
+		}
+	}
+
+	// Execution logs
+	if len(m.logs) > 0 && ConversationView {
+		b.WriteString("\n")
+		conversation, anchors := renderConversationWithAnchors(m.logs, m.width-6, m.focused, func(text string) (string, error) {
+			renderer := m.getGlamourRenderer(m.focused)
+			if renderer == nil {
+				return "", errNoRenderer
+			}
+			return renderer.Render(text)
+		})
+		m.messageAnchors = anchors
+		b.WriteString(conversation)
+	} else if false {
+		b.WriteString(renderConversation(m.logs, m.width-6, m.focused, func(text string) (string, error) {
+			renderer := m.getGlamourRenderer(m.focused)
+			if renderer == nil {
+				return "", errNoRenderer
+			}
+			return renderer.Render(text)
+		}))
+	} else if len(m.logs) > 0 {
+		b.WriteString("\n")
+		// Labels always use full opacity for clarity and accessibility
+		b.WriteString(Bold.Render("Execution Log"))
+		b.WriteString("\n\n")
+
+		for _, log := range m.logs {
+			// Skip internal-only log entries not meant for display
+			if log.LineType == "pending_tool" || log.LineType == "pr_done_marker" {
+				continue
+			}
+			icon := "  "
+			switch log.LineType {
+			case "system":
+				icon = "🔵"
+			case "text":
+				icon = "💬"
+			case "tool":
+				icon = "🔧"
+			case "error":
+				icon = "❌"
+			case "question":
+				icon = "❓"
+			case "user":
+				icon = "👤"
+			case "output":
+				icon = "📤"
+			}
+
+			var line string
+			if m.focused {
+				line = fmt.Sprintf("%s %s %s",
+					Dim.Render(log.CreatedAt.Format("15:04:05")),
+					icon,
+					log.Content,
+				)
+			} else {
+				line = fmt.Sprintf("%s %s %s",
+					dimmedStyle.Render(log.CreatedAt.Format("15:04:05")),
+					icon,
+					dimmedStyle.Render(log.Content),
+				)
+			}
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+
+	content := b.String()
+
+	// Cache the rendered content
+	m.lastRenderedBody = t.Body
+	m.lastRenderedSummary = t.Summary
+	m.lastRenderedLogHash = logHash
+	m.lastRenderedFocused = m.focused
+	m.lastRenderedWorkflow = workflowHash
+	m.cachedContent = content
+
+	return content
+}
+
+// renderHelp renders the footer for the current focus, padded so that focus
+// never changes its height. The pane above is sized from this: when the two
+// variants differed the whole thread jumped a row as focus moved in and out of
+// the message box.
+func (m *DetailModel) renderHelp() string {
+	base := m.renderHelpRow(false)
+	if !m.ComposerFocused() {
+		return base
+	}
+
+	composing := m.renderHelpRow(true)
+	for lipgloss.Height(composing) < lipgloss.Height(base) {
+		composing += "\n"
+	}
+	return composing
+}
+
+func (m *DetailModel) renderHelpRow(composing bool) string {
+	// While the composer has the keyboard, the board's single-key actions are
+	// unreachable, so the footer has to say how to get back to them rather than
+	// list keys that will land in the message.
+	if composing {
+		keyStyle := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
+		descStyle := lipgloss.NewStyle().Foreground(ColorMuted)
+		parts := []string{
+			keyStyle.Render("esc") + " " + descStyle.Render("shortcuts"),
+			keyStyle.Render("enter") + " " + descStyle.Render("send"),
+			keyStyle.Render("shift+enter") + " " + descStyle.Render("newline"),
+			keyStyle.Render(arrowPairLabel()) + " " + descStyle.Render("scroll"),
+			keyStyle.Render("shift+"+arrowPairLabel()) + " " + descStyle.Render("prev/next message"),
+		}
+		return lipgloss.NewStyle().
+			Width(m.width).
+			MaxWidth(m.width).
+			MaxHeight(1).
+			Render(" " + strings.Join(parts, descStyle.Render("  •  ")))
+	}
+
+	type helpKey struct {
+		key      string
+		desc     string
+		disabled bool // When disabled, always show grayed out
+		primary  bool // Shown even when the help row is collapsed
+	}
+
+	// Check if navigation is available (more than 1 task in column)
+	hasNavigation := m.totalInColumn > 1
+
+	// With the executor or shell pane focused, keystrokes go to that pane, not
+	// to us: only the root-table tmux bindings from bindPaneNavigation still
+	// reach the TUI, so list those instead of keys that would type into Claude.
+	if !m.focused {
+		dimmedKeyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
+		dimmedDescStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563"))
+		render := func(k, desc string, disabled bool) string {
+			if disabled {
+				return dimmedKeyStyle.Render(k) + " " + dimmedDescStyle.Render(desc)
+			}
+			return HelpKey.Render(k) + " " + HelpDesc.Render(desc)
+		}
+		arrows := IconArrowUp() + IconArrowDown()
+		return HelpBar.Render(
+			render("alt+shift+"+arrowPairLabel(), "prev/next task", !hasNavigation) + "  " +
+				render("shift+"+arrows, "switch pane", false))
+	}
+
+	// Primary keys are the handful of high-frequency actions kept visible when
+	// the row is collapsed; everything else is tucked behind '?'.
+	keys := []helpKey{
+		{arrowPairLabel(), "scroll", false, true},
+		{"shift+" + arrowPairLabel(), "prev/next message", false, false},
+		{"ctrl+l", "jump to latest", false, false},
+		{"ctrl+g", "quote into message", false, false},
+		{"ctrl+t", "mouse on/off (for select & copy)", false, false},
+		{"ctrl+" + arrowPairLabel(), "prev/next task", !hasNavigation, false},
+	}
+
+	// Show scroll hint when content is scrollable
+	if m.viewport.TotalLineCount() > m.viewport.VisibleLineCount() {
+		keys = append(keys, helpKey{"j/k/wheel", "scroll", false, false})
+	}
+
+	// TaskYou queues a task and then executes it. A bb thread runs the moment it
+	// is created and is driven by messages afterwards, so there is nothing for
+	// "execute" to mean and the key is not offered.
+	claudeRunning := m.claudeMemoryMB > 0
+	if !claudeRunning && !ComposerEnabled {
+		keys = append(keys, helpKey{"x", "execute", false, true})
+		keys = append(keys, helpKey{"X", "execute dangerous", false, false})
+	}
+	if ComposerEnabled {
+		keys = append(keys, helpKey{"i", "message", false, true})
+		keys = append(keys, helpKey{"y", "answer", false, false})
+		keys = append(keys, helpKey{"r", "retry failed turn", false, false})
+	}
+
+	hasPanes := m.claudePaneID != "" || m.workdirPaneID != "" || (!m.paneLoading && m.remotePaneID != "")
+
+	// A halted view is a dead end without its recovery key, so promote it: the
+	// worktree rebuild is the way out of "worktree missing", a refused adopt and
+	// a tripped spawn breaker alike.
+	if m.paneSetupHalted != "" {
+		keys = append(keys, helpKey{"W", "recreate worktree", false, true})
+	}
+	if m.SessionClosed() {
+		keys = append(keys, helpKey{"enter", "resume session", false, true})
+	}
+
+	keys = append(keys, helpKey{"e", "edit", false, true})
+
+	// Only show retry when Claude is not running
+	if !claudeRunning {
+		keys = append(keys, helpKey{"r", "retry", false, false})
+	}
+
+	// Always show status change option
+	keys = append(keys, helpKey{"S", "status", false, true})
+
+	if m.task != nil {
+		pinDesc := "pin task"
+		if m.task.Pinned {
+			pinDesc = "unpin task"
+		}
+		keys = append(keys, helpKey{"t", pinDesc, false, false})
+	}
+
+	// Show dangerous mode toggle when task is processing or blocked
+	if m.task != nil && (m.task.Status == db.StatusProcessing || m.task.Status == db.StatusBlocked) {
+		toggleDesc := "dangerous mode"
+		if m.task.DangerousMode {
+			toggleDesc = "safe mode"
+		}
+		keys = append(keys, helpKey{"!", toggleDesc, false, false})
+	}
+
+	// Show pane navigation shortcut when panes are visible
+	if hasPanes && os.Getenv("TMUX") != "" {
+		keys = append(keys, helpKey{"shift+" + IconArrowUp() + IconArrowDown(), "switch pane", false, false})
+		// Show shell pane toggle shortcut
+		toggleDesc := "hide shell"
+		if m.shellPaneHidden {
+			toggleDesc = "show shell"
+		}
+		keys = append(keys, helpKey{"\\", toggleDesc, false, false})
+	}
+
+	// Open PR shortcut (only when task has a PR)
+	if m.task != nil && m.task.PRURL != "" {
+		keys = append(keys, helpKey{"G", "open PR", false, false})
+	}
+
+	// Show contextual label for 'b' key based on whether process is running
+	browserLabel := "open dir"
+	if m.task != nil && m.task.Port != 0 && m.executor != nil && m.executor.IsRunning(m.task.ID) {
+		browserLabel = "browser"
+	}
+	keys = append(keys, []helpKey{
+		{"b", browserLabel, false, false},
+		{"c", "close", false, false},
+		{"a", "archive", false, false},
+		{"d", "delete", false, false},
+		{"esc", "back", false, true},
+	}...)
+
+	var help string
+	dimmedKeyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
+	dimmedDescStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563"))
+
+	rendered := 0
+	for _, k := range keys {
+		// When collapsed, only the primary keys are shown.
+		if !m.helpExpanded && !k.primary {
+			continue
+		}
+		if rendered > 0 {
+			help += "  "
+		}
+		// Disabled keys are always dimmed, regardless of focus
+		if k.disabled || !m.focused {
+			help += dimmedKeyStyle.Render(k.key) + " " + dimmedDescStyle.Render(k.desc)
+		} else {
+			help += HelpKey.Render(k.key) + " " + HelpDesc.Render(k.desc)
+		}
+		rendered++
+	}
+
+	// Trailing '?' affordance to expand/collapse the rest.
+	moreDesc := "more"
+	if m.helpExpanded {
+		moreDesc = "less"
+	}
+	if rendered > 0 {
+		help += "  "
+	}
+	help += dimmedKeyStyle.Render("?") + " " + dimmedDescStyle.Render(moreDesc)
+
+	return HelpBar.Render(help)
+}
+
+// getClaudeMemoryMB returns the memory usage in MB for the Claude process running this task.
+// Returns 0 if no process is found or on error.
+func (m *DetailModel) getClaudeMemoryMB() int {
+	if m.task == nil {
+		return 0
+	}
+
+	// Use joined pane ID if available, otherwise fall back to cached window target
+	paneTarget := m.claudePaneID
+	if paneTarget == "" {
+		paneTarget = m.cachedWindowTarget
+	}
+	if paneTarget == "" {
+		return 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Get the shell PID from the tmux pane
+	out, err := agentTmux(ctx, "display-message", "-t", paneTarget, "-p", "#{pane_pid}").Output()
+	if err != nil {
+		return 0
+	}
+
+	shellPID := strings.TrimSpace(string(out))
+	if shellPID == "" {
+		return 0
+	}
+
+	// Find claude child process
+	childOut, err := osExec.CommandContext(ctx, "pgrep", "-P", shellPID, "claude").Output()
+	var pid string
+	if err == nil && len(childOut) > 0 {
+		pid = strings.TrimSpace(string(childOut))
+	} else {
+		pid = shellPID // fallback to shell
+	}
+
+	// Get RSS in KB from ps
+	psOut, err := osExec.CommandContext(ctx, "ps", "-o", "rss=", "-p", pid).Output()
+	if err != nil {
+		return 0
+	}
+
+	rssKB, err := strconv.Atoi(strings.TrimSpace(string(psOut)))
+	if err != nil {
+		return 0
+	}
+
+	return rssKB / 1024 // Convert to MB
+}

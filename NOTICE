@@ -1,0 +1,7 @@
+bb-tui is derived from TaskYou (https://github.com/bborn/taskyou).
+
+The terminal UI, its data types, and the supporting packages under internal/
+originate in that project and are used here under the MIT License reproduced in
+LICENSE. Import paths were rewritten from github.com/bborn/workflow to
+github.com/bborn/bb-tui, and the data layer was replaced: where TaskYou reads a
+local SQLite database, bb-tui reads bb's HTTP and WebSocket API.

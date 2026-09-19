@@ -1,0 +1,217 @@
+package pipeline
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/bborn/bb-tui/internal/db"
+)
+
+// Custom workflows are authored as plain YAML files — one workflow per file —
+// so a user (or the LLM in `ty pipeline new`) can define a whole new flow (add a
+// QA step, a different shape) without touching Go. Files live in a global dir
+// (~/.config/task/workflows) and an optional per-project dir
+// (<project>/.taskyou/workflows); a project file shadows a global one of the same
+// name, which shadows a built-in.
+//
+// Authoring is just prompts: each step says what it does and what it depends on;
+// the git handoff (which branch to push to, when to open the PR) is derived from
+// the step's position in the DAG — see compose.go.
+
+// stepYAML is the on-disk form of a step.
+type stepYAML struct {
+	Name      string            `yaml:"name"`
+	Kind      string            `yaml:"kind,omitempty"` // Run another kind here (its instructions apply; if it has steps, they're inlined).
+	Executor  string            `yaml:"executor,omitempty"`
+	Model     string            `yaml:"model,omitempty"`
+	ConfigDir string            `yaml:"config_dir,omitempty"` // Per-step CLAUDE_CONFIG_DIR override: route this step's Claude through a different config (e.g. an ollama-backed one) without changing the project. ~ is expanded.
+	Env       map[string]string `yaml:"env,omitempty"`        // Per-step env overrides injected as a process-env prefix on the claude command (e.g. ANTHROPIC_BASE_URL/AUTH_TOKEN to route through ollama). Distinct from config_dir: env injection keeps the default config dir intact and is what actually reaches a token-auth proxy like ollama.
+	Deps      []string          `yaml:"deps,omitempty"`
+	Prompt    string            `yaml:"prompt,omitempty"` // Optional when `kind` is set: the referenced kind supplies the instructions.
+	// Verbatim marks a step whose prompt IS the full instruction (no DAG-derived
+	// git handoff is added). It's set when `ty pipeline edit` ejects a built-in
+	// workflow, so the ejected file behaves identically to the built-in.
+	Verbatim bool `yaml:"verbatim,omitempty"`
+	// Gate marks a human-in-the-loop step: when it finishes producing its output it
+	// parks in 'blocked' for human review instead of advancing the DAG. A human
+	// releases it (and its dependents) with `ty close <id>`. Used for high-leverage
+	// boundaries (e.g. the RPI design/plan phases) where a bad phase should be caught
+	// before it poisons everything downstream.
+	Gate bool `yaml:"gate,omitempty"`
+	// Verify is an opt-in evidence gate: a shell command run in the step's worktree
+	// when the agent calls taskyou_complete. A non-zero exit rejects the completion
+	// (the step keeps running, the command output is handed back) instead of trusting
+	// the agent's say-so — the backstop for "agent called done but the build is red".
+	// "" = no gate. Distinct from Gate (a human boundary); the two compose.
+	Verify string `yaml:"verify,omitempty"`
+}
+
+// definitionYAML is the on-disk form of a kind. `steps` makes it a workflow;
+// `instructions` (with no steps) makes it a single-task kind — the same shape as a
+// task type. One file format, one differentiator: the presence of `steps`.
+type definitionYAML struct {
+	Name         string     `yaml:"name"`
+	Description  string     `yaml:"description,omitempty"`
+	Instructions string     `yaml:"instructions,omitempty"`
+	Steps        []stepYAML `yaml:"steps,omitempty"`
+}
+
+// WorkflowsDir returns the global directory custom workflow files live in.
+func WorkflowsDir() string {
+	if dir := os.Getenv("TY_WORKFLOWS_DIR"); dir != "" {
+		return dir
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "task", "workflows")
+}
+
+// WorkflowDirs returns the directories to search for custom workflows: the global
+// dir plus the project-local .taskyou/workflows (when a project dir is given).
+// Later dirs win on name collisions.
+func WorkflowDirs(projectDir string) []string {
+	dirs := []string{WorkflowsDir()}
+	if projectDir != "" {
+		dirs = append(dirs, filepath.Join(projectDir, ".taskyou", "workflows"))
+	}
+	return dirs
+}
+
+// ParseDefinition parses and validates one workflow YAML document.
+func ParseDefinition(data []byte) (Definition, error) {
+	var doc definitionYAML
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return Definition{}, fmt.Errorf("parse workflow yaml: %w", err)
+	}
+	if strings.TrimSpace(doc.Name) == "" {
+		return Definition{}, fmt.Errorf("workflow is missing a name")
+	}
+	def := Definition{
+		Name:         strings.TrimSpace(doc.Name),
+		Description:  strings.TrimSpace(doc.Description),
+		Instructions: strings.TrimSpace(doc.Instructions),
+		Custom:       true,
+	}
+	for _, s := range doc.Steps {
+		name := strings.TrimSpace(s.Name)
+		if name == "" {
+			return Definition{}, fmt.Errorf("kind %q has a step with no name", def.Name)
+		}
+		kind := strings.TrimSpace(s.Kind)
+		// A step must say what it does: either its own prompt, or a kind to run.
+		if strings.TrimSpace(s.Prompt) == "" && kind == "" {
+			return Definition{}, fmt.Errorf("step %q needs a prompt or a kind", name)
+		}
+		exec := strings.TrimSpace(s.Executor)
+		if exec == "" {
+			exec = "claude"
+		}
+		// A model the step's CLI won't accept fails silently at launch (the agent
+		// rejects the flag inside tmux and the step stalls), so catch it while the
+		// file is being read. Steps routed at a proxy — a config_dir or an
+		// ANTHROPIC_BASE_URL env override, the ollama shape — name the proxy's
+		// models, which ty can't check.
+		if !db.ModelBackendIsCustom(s.ConfigDir, s.Env) {
+			if err := db.ValidateModel(exec, s.Model); err != nil {
+				return Definition{}, fmt.Errorf("step %q: %w", name, err)
+			}
+		}
+		step := Step{
+			Name:      name,
+			Kind:      kind,
+			Executor:  exec,
+			Model:     strings.TrimSpace(s.Model),
+			ConfigDir: strings.TrimSpace(s.ConfigDir),
+			Env:       s.Env,
+			Deps:      s.Deps,
+			Gate:      s.Gate,
+			Verify:    strings.TrimSpace(s.Verify),
+		}
+		// A verbatim step's prompt is its full instruction; otherwise the prompt is
+		// the work and the git handoff is composed from the DAG.
+		if s.Verbatim {
+			step.Instruction = s.Prompt
+		} else {
+			step.Prompt = s.Prompt
+		}
+		def.Steps = append(def.Steps, step)
+	}
+	// A steps-less kind must carry instructions (it's a single-task prompt preset);
+	// a kind with steps is a workflow and is validated as a DAG.
+	if def.IsSingle() {
+		if def.Instructions == "" {
+			return Definition{}, fmt.Errorf("kind %q has no steps and no instructions", def.Name)
+		}
+		return def, nil
+	}
+	if err := def.validate(); err != nil {
+		return Definition{}, err
+	}
+	return def, nil
+}
+
+// Marshal renders a Definition back to YAML (used by `ty pipeline new`).
+func Marshal(def Definition) ([]byte, error) {
+	doc := definitionYAML{Name: def.Name, Description: def.Description}
+	for _, s := range def.Steps {
+		out := stepYAML{
+			Name:      s.Name,
+			Executor:  s.Executor,
+			Model:     s.Model,
+			ConfigDir: s.ConfigDir,
+			Env:       s.Env,
+			Deps:      s.Deps,
+			Prompt:    s.Prompt,
+			Gate:      s.Gate,
+			Verify:    s.Verify,
+		}
+		// A built-in step carries a full Instruction — write it as a verbatim
+		// prompt so the ejected file behaves identically when reloaded.
+		if s.Instruction != "" {
+			out.Prompt = s.Instruction
+			out.Verbatim = true
+		}
+		doc.Steps = append(doc.Steps, out)
+	}
+	return yaml.Marshal(doc)
+}
+
+// loadCustomDefinitions reads every *.yaml/*.yml workflow in the given dirs.
+// Later dirs shadow earlier ones by name. Unreadable or invalid files are
+// skipped and returned in the errs slice so callers can surface them without
+// failing the whole load.
+func loadCustomDefinitions(dirs []string) (map[string]Definition, []error) {
+	out := make(map[string]Definition)
+	var errs []error
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue // Missing dir is fine.
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			ext := strings.ToLower(filepath.Ext(e.Name()))
+			if ext != ".yaml" && ext != ".yml" {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			data, err := os.ReadFile(path)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", path, err))
+				continue
+			}
+			def, err := ParseDefinition(data)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", path, err))
+				continue
+			}
+			out[def.Name] = def
+		}
+	}
+	return out, errs
+}

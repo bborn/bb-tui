@@ -1,0 +1,212 @@
+package executor
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/log"
+
+	"github.com/bborn/bb-tui/internal/db"
+)
+
+// PiExecutor implements TaskExecutor for Pi coding agent.
+type PiExecutor struct {
+	executor *Executor
+	logger   *log.Logger
+}
+
+// NewPiExecutor creates a new Pi executor.
+func NewPiExecutor(e *Executor) *PiExecutor {
+	return &PiExecutor{
+		executor: e,
+		logger:   e.logger,
+	}
+}
+
+// Name returns the executor name.
+func (p *PiExecutor) Name() string {
+	return db.ExecutorPi
+}
+
+// IsAvailable checks if the pi CLI is installed.
+func (p *PiExecutor) IsAvailable() bool {
+	return binaryOnPath("pi")
+}
+
+// Execute runs a task using Pi.
+func (p *PiExecutor) Execute(ctx context.Context, task *db.Task, workDir, prompt string) ExecResult {
+	result := p.executor.runPi(ctx, task, workDir, prompt)
+	return ExecResult(result)
+}
+
+// Resume resumes a previous Pi session with feedback.
+func (p *PiExecutor) Resume(ctx context.Context, task *db.Task, workDir, prompt, feedback string) ExecResult {
+	result := p.executor.runPiResume(ctx, task, workDir, prompt, feedback)
+	return ExecResult(result)
+}
+
+// GetProcessID returns the PID of the Pi process for a task.
+func (p *PiExecutor) GetProcessID(taskID int64) int {
+	return p.executor.getPiPID(taskID)
+}
+
+// Kill terminates the Pi process for a task.
+func (p *PiExecutor) Kill(taskID int64) bool {
+	return p.executor.KillPiProcess(taskID)
+}
+
+// BuildCommand returns the shell command to start an interactive Pi session.
+func (p *PiExecutor) BuildCommand(task *db.Task, sessionID, prompt string) string {
+	// Get session ID for environment
+	worktreeSessionID := os.Getenv("WORKTREE_SESSION_ID")
+	if worktreeSessionID == "" {
+		worktreeSessionID = fmt.Sprintf("%d", os.Getpid())
+	}
+
+	// Determine explicit session path if not provided or if sessionID matches it
+	// If sessionID is provided (from task.ClaudeSessionID), use it as the path.
+	// If not, calculate it.
+	sessionPath := sessionID
+	if sessionPath == "" {
+		worktreesDir := filepath.Dir(task.WorktreePath)
+		sessionPath = filepath.Join(worktreesDir, "sessions", fmt.Sprintf("task-%d.jsonl", task.ID))
+	}
+
+	// Ensure session directory exists (for manual runs via BuildCommand)
+	os.MkdirAll(filepath.Dir(sessionPath), 0755)
+
+	// Build command - resume if we have a session ID, otherwise start fresh
+	if sessionID != "" {
+		return fmt.Sprintf(`WORKTREE_TASK_ID=%d WORKTREE_SESSION_ID=%s WORKTREE_PORT=%d WORKTREE_PATH=%q pi --session %q --continue`,
+			task.ID, worktreeSessionID, task.Port, task.WorktreePath, sessionPath)
+	}
+
+	// Start fresh - if prompt is provided, write to temp file and pass it
+	if prompt != "" {
+		// Create temp file for prompt (avoids shell quoting issues)
+		promptFile, err := os.CreateTemp("", "task-prompt-*.txt")
+		if err != nil {
+			p.logger.Error("BuildCommand: failed to create temp file", "error", err)
+			return fmt.Sprintf(`WORKTREE_TASK_ID=%d WORKTREE_SESSION_ID=%s WORKTREE_PORT=%d WORKTREE_PATH=%q pi --session %q`,
+				task.ID, worktreeSessionID, task.Port, task.WorktreePath, sessionPath)
+		}
+		promptFile.WriteString(prompt)
+		promptFile.Close()
+
+		return fmt.Sprintf(`WORKTREE_TASK_ID=%d WORKTREE_SESSION_ID=%s WORKTREE_PORT=%d WORKTREE_PATH=%q pi --session %q "$(cat %q)"; rm -f %q`,
+			task.ID, worktreeSessionID, task.Port, task.WorktreePath, sessionPath, promptFile.Name(), promptFile.Name())
+	}
+
+	return fmt.Sprintf(`WORKTREE_TASK_ID=%d WORKTREE_SESSION_ID=%s WORKTREE_PORT=%d WORKTREE_PATH=%q pi --session %q`,
+		task.ID, worktreeSessionID, task.Port, task.WorktreePath, sessionPath)
+}
+
+// ---- Session and Dangerous Mode Support ----
+
+// SupportsSessionResume returns true - Pi supports session resume via --continue.
+func (p *PiExecutor) SupportsSessionResume() bool {
+	return true
+}
+
+// SupportsDangerousMode returns false - Pi doesn't have a dangerous mode flag.
+func (p *PiExecutor) SupportsDangerousMode() bool {
+	return false
+}
+
+// FindSessionID discovers the most recent Pi session ID for the given workDir.
+func (p *PiExecutor) FindSessionID(workDir string) string {
+	return findPiSessionID(workDir)
+}
+
+// ResumeDangerous is not supported for Pi.
+func (p *PiExecutor) ResumeDangerous(task *db.Task, workDir string) bool {
+	p.executor.logLine(task.ID, "system", "Pi executor does not support dangerous mode")
+	return false
+}
+
+// ResumeSafe is not supported for Pi.
+func (p *PiExecutor) ResumeSafe(task *db.Task, workDir string) bool {
+	p.executor.logLine(task.ID, "system", "Pi executor does not support dangerous mode")
+	return false
+}
+
+// findPiSessionID finds the most recent Pi session ID for a workDir.
+// It prioritizes explicit session paths in .task-worktrees/sessions/task-<ID>.jsonl
+// but falls back to Pi's internal storage (~/.pi/agent/sessions/...) for backward compatibility.
+func findPiSessionID(workDir string) string {
+	// 1. Try to find explicit session path based on task ID in directory name
+	// workDir format: .../123-slug
+	baseName := filepath.Base(workDir)
+	var taskID int64
+	// Try to parse ID from beginning of directory name
+	// Sscanf will match "123-" and stop at non-digit
+	// But baseName is "123-slug", so "%d-" might work if I just check for prefix
+	parts := strings.SplitN(baseName, "-", 2)
+	if len(parts) >= 2 {
+		if id, err := fmt.Sscanf(parts[0], "%d", &taskID); err == nil && id > 0 {
+			worktreesDir := filepath.Dir(workDir)
+			sessionPath := filepath.Join(worktreesDir, "sessions", fmt.Sprintf("task-%d.jsonl", taskID))
+			if piSessionExists(sessionPath) {
+				return sessionPath
+			}
+		}
+	}
+
+	// 2. Fallback to legacy path discovery
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+
+	return findPiLegacySessionID(workDir, filepath.Join(home, ".pi", "agent", "sessions"))
+}
+
+// findPiLegacySessionID scans an explicit root without changing the process's home directory.
+func findPiLegacySessionID(workDir, sessionsDir string) string {
+	// Pi escapes the path similar to Claude: /Users/bruno/foo -> --Users-bruno-foo--
+	escapedPath := "--" + strings.ReplaceAll(workDir, "/", "-") + "--"
+	sessionDir := filepath.Join(sessionsDir, escapedPath)
+
+	// Find the most recent .jsonl file
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return ""
+	}
+
+	var latestTime time.Time
+	var latestSession string
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		if info.ModTime().After(latestTime) {
+			latestTime = info.ModTime()
+			// Session file format: 2026-01-31T16-56-49-866Z_aa857952-4ced-4fcc-a8c9-53966931221d.jsonl
+			// We just need the path to use with --continue
+			latestSession = filepath.Join(sessionDir, name)
+		}
+	}
+
+	return latestSession
+}
+
+// piSessionExists checks if a Pi session file exists.
+func piSessionExists(sessionPath string) bool {
+	if sessionPath == "" {
+		return false
+	}
+	_, err := os.Stat(sessionPath)
+	return err == nil
+}

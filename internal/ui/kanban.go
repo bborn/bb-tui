@@ -1,0 +1,1832 @@
+package ui
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/bborn/bb-tui/internal/db"
+	"github.com/bborn/bb-tui/internal/github"
+	"github.com/bborn/bb-tui/internal/pipeline"
+)
+
+// ColumnTitles labels the four board columns. They are variables because the
+// column a status lands in is a product decision: TaskYou tracks work it queues
+// itself, while bb threads start on creation and come back to you for answers,
+// so bb-tui names them after what bb actually does.
+var ColumnTitles = [4]string{"Backlog", "In Progress", "Blocked", "Done"}
+
+// emptyColumnMessage returns a contextual message for empty columns.
+func emptyColumnMessage(status string) string {
+	switch status {
+	case db.StatusBacklog:
+		return "Press 'n' to create a task"
+	case db.StatusQueued:
+		return "Press 'x' to execute a task"
+	case db.StatusBlocked:
+		return "No tasks need input"
+	case db.StatusDone:
+		return "Completed tasks appear here"
+	default:
+		return "No tasks"
+	}
+}
+
+// KanbanColumn represents a column in the kanban board.
+type KanbanColumn struct {
+	Title  string
+	Status string // The status this column represents
+	Tasks  []*db.Task
+	Color  lipgloss.Color
+	Icon   string // Visual icon for the column
+}
+
+// MobileWidthThreshold is the minimum width for showing all columns.
+// Below this, only the selected column is shown.
+const MobileWidthThreshold = 80
+
+// KanbanBoard manages the kanban board state.
+type KanbanBoard struct {
+	columns           []KanbanColumn
+	selectedCol       int
+	selectedRow       int
+	scrollOffsets     []int        // Scroll offset per column
+	collapsedColumns  map[int]bool // Columns that are collapsed (show only header)
+	width             int
+	height            int
+	allTasks          []*db.Task                // All tasks
+	prInfo            map[int64]*github.PRInfo  // PR info by task ID
+	runningProcesses  map[int64]bool            // Tasks with running shell processes
+	tasksNeedingInput map[int64]bool            // Tasks waiting for user input (active input notification)
+	blockedByDeps     map[int64]int             // Tasks blocked by dependencies (task ID -> open blocker count)
+	workflowGroups    map[int64]*pipeline.Group // Lead task ID -> workflow group (collapsed workflow cards)
+	hiddenDoneCount   int                       // Number of done tasks not shown (older ones)
+	originColumn      int                       // Column where detail view navigation started (-1 = not set)
+
+	// Render cache. View() is called on every Bubble Tea Update (key, tick,
+	// mouse move, task event), but the board's pixels only change when one of
+	// its inputs does. We hash all rendering inputs into a signature and reuse
+	// the previously rendered string when the signature is unchanged, so idle
+	// re-renders (the common case) cost a hash instead of a full lipgloss pass.
+	cachedView    string
+	cachedViewSig uint64
+	cachedViewOK  bool
+
+	// cardCache memoizes individual rendered task cards by a signature of their
+	// inputs, so a board re-render (cache miss above — e.g. moving the selection
+	// or one task changing status) only pays the lipgloss cost for the cards that
+	// actually changed. Bounded; reset wholesale once it grows past cardCacheMax.
+	cardCache map[uint64]string
+
+	// Each card carries a live sub-line: what the running agent is doing right
+	// now (from latestActivity), the stand / waiting question when blocked, or
+	// an age hint for idle statuses.
+	latestActivity map[int64]*db.TaskLog
+
+	// List mode: the same tasks rendered as one flat line each instead of four
+	// status columns. The columns stay populated either way (the count helpers
+	// and the render signature read them), so toggling is free. See list.go.
+	listMode   bool
+	listTasks  []*db.Task  // k.allTasks in list order (pinned, then urgency)
+	listRow    int         // selected index into listTasks
+	listScroll int         // first visible index
+	listTitle  string      // active saved view / filter, shown in the header
+	listOpts   ListOptions // grouping and sort (see listopts.go)
+}
+
+// cardHeight is the number of vertical lines a task card occupies, including
+// its bottom margin. Three content lines (id, title, sub-line) + 1 margin.
+const cardHeight = 4
+
+// cardCacheMax bounds the per-card render cache. Steady-state usage is a few
+// dozen entries; the cap guards against unbounded growth over a long session as
+// task titles/statuses churn.
+const cardCacheMax = 4096
+
+// IsMobileMode returns true if the board should show single-column mode.
+func (k *KanbanBoard) IsMobileMode() bool {
+	return k.width < MobileWidthThreshold
+}
+
+// NewKanbanBoard creates a new kanban board.
+func NewKanbanBoard(width, height int) *KanbanBoard {
+	columns := makeKanbanColumns()
+	return &KanbanBoard{
+		columns:          columns,
+		scrollOffsets:    make([]int, len(columns)),
+		collapsedColumns: make(map[int]bool),
+		width:            width,
+		height:           height,
+		prInfo:           make(map[int64]*github.PRInfo),
+		runningProcesses: make(map[int64]bool),
+		originColumn:     -1,
+		listOpts:         DefaultListOptions(),
+	}
+}
+
+// makeKanbanColumns creates columns with current theme colors.
+func makeKanbanColumns() []KanbanColumn {
+	return []KanbanColumn{
+		{Title: ColumnTitles[0], Status: db.StatusBacklog, Color: ColorMuted, Icon: IconBacklog()},
+		{Title: ColumnTitles[1], Status: db.StatusQueued, Color: ColorInProgress, Icon: IconInProgress()}, // Also shows processing
+		{Title: ColumnTitles[2], Status: db.StatusBlocked, Color: ColorBlocked, Icon: IconBlocked()},
+		{Title: ColumnTitles[3], Status: db.StatusDone, Color: ColorDone, Icon: IconDone()},
+	}
+}
+
+// RefreshTheme updates column colors after a theme change.
+func (k *KanbanBoard) RefreshTheme() {
+	newCols := makeKanbanColumns()
+	for i := range k.columns {
+		if i < len(newCols) {
+			k.columns[i].Color = newCols[i].Color
+			k.columns[i].Icon = newCols[i].Icon
+		}
+	}
+}
+
+// SetTasks updates the tasks in the kanban board.
+func (k *KanbanBoard) SetTasks(tasks []*db.Task) {
+	var selectedID int64
+	prevCol := k.selectedCol
+	prevRow := k.selectedRow
+	if selected := k.SelectedTask(); selected != nil {
+		selectedID = selected.ID
+	}
+
+	k.allTasks = tasks
+	k.distributeTasksToColumns()
+	k.rebuildListTasks()
+
+	if k.listMode {
+		// The flat list has no columns to stay in — just keep the same task
+		// selected wherever it moved to.
+		if selectedID != 0 {
+			k.selectListTask(selectedID)
+		}
+		return
+	}
+
+	// When origin column is set (detail view navigation), stay in that column
+	// even if the task moved to a different column
+	if k.originColumn >= 0 {
+		k.selectedCol = k.originColumn
+		k.clampSelection()
+		return
+	}
+
+	if selectedID != 0 {
+		// Try to find the task in its (possibly new) position
+		found := k.SelectTask(selectedID)
+		if found && k.selectedCol != prevCol {
+			// Task moved to a different column (e.g. after permission grant).
+			// Stay in the original column and select the next task there.
+			k.selectedCol = prevCol
+			k.selectedRow = prevRow
+			k.clampSelection()
+		}
+	}
+}
+
+// SetHiddenDoneCount sets the number of done tasks not shown in the kanban.
+func (k *KanbanBoard) SetHiddenDoneCount(count int) {
+	k.hiddenDoneCount = count
+}
+
+// SetPRInfo updates the PR info for a task.
+func (k *KanbanBoard) SetPRInfo(taskID int64, info *github.PRInfo) {
+	if k.prInfo == nil {
+		k.prInfo = make(map[int64]*github.PRInfo)
+	}
+	k.prInfo[taskID] = info
+}
+
+// GetPRInfo returns the PR info for a task.
+func (k *KanbanBoard) GetPRInfo(taskID int64) *github.PRInfo {
+	if k.prInfo == nil {
+		return nil
+	}
+	return k.prInfo[taskID]
+}
+
+// SetRunningProcesses updates the map of tasks with running shell processes.
+func (k *KanbanBoard) SetRunningProcesses(running map[int64]bool) {
+	k.runningProcesses = running
+}
+
+// HasRunningProcess returns true if the task has a running shell process.
+func (k *KanbanBoard) HasRunningProcess(taskID int64) bool {
+	if k.runningProcesses == nil {
+		return false
+	}
+	return k.runningProcesses[taskID]
+}
+
+// SetTasksNeedingInput updates the map of tasks waiting for user input.
+func (k *KanbanBoard) SetTasksNeedingInput(needsInput map[int64]bool) {
+	k.tasksNeedingInput = needsInput
+}
+
+// NeedsInput returns true if the task has an active input notification.
+func (k *KanbanBoard) NeedsInput(taskID int64) bool {
+	if k.tasksNeedingInput == nil {
+		return false
+	}
+	return k.tasksNeedingInput[taskID]
+}
+
+// SetBlockedByDeps updates the map of tasks blocked by dependencies.
+// The map contains task ID -> number of open blockers.
+// SetWorkflowGroups records the collapsed workflow groups, keyed by the lead task
+// whose card represents the whole workflow on the board.
+func (k *KanbanBoard) SetWorkflowGroups(groups map[int64]*pipeline.Group) {
+	k.workflowGroups = groups
+}
+
+// workflowGroup returns the workflow group a task leads, or nil.
+func (k *KanbanBoard) workflowGroup(taskID int64) *pipeline.Group {
+	if k.workflowGroups == nil {
+		return nil
+	}
+	return k.workflowGroups[taskID]
+}
+
+func (k *KanbanBoard) SetBlockedByDeps(blockedByDeps map[int64]int) {
+	k.blockedByDeps = blockedByDeps
+}
+
+// GetOpenBlockerCount returns the number of open blockers for a task.
+// Returns 0 if the task has no blockers.
+func (k *KanbanBoard) GetOpenBlockerCount(taskID int64) int {
+	if k.blockedByDeps == nil {
+		return 0
+	}
+	return k.blockedByDeps[taskID]
+}
+
+// IsBlockedByDeps returns true if the task is blocked by dependencies.
+func (k *KanbanBoard) IsBlockedByDeps(taskID int64) bool {
+	return k.GetOpenBlockerCount(taskID) > 0
+}
+
+// SetOriginColumn sets the origin column for detail view navigation.
+// This preserves the column context even if the task moves to a different column.
+func (k *KanbanBoard) SetOriginColumn() {
+	k.originColumn = k.selectedCol
+}
+
+// ClearOriginColumn clears the origin column, returning to normal navigation.
+func (k *KanbanBoard) ClearOriginColumn() {
+	k.originColumn = -1
+}
+
+// HasOriginColumn returns true if an origin column is set.
+func (k *KanbanBoard) HasOriginColumn() bool {
+	return k.originColumn >= 0
+}
+
+// IsColumnCollapsed returns true if the column at the given index is collapsed.
+func (k *KanbanBoard) IsColumnCollapsed(colIdx int) bool {
+	if k.collapsedColumns == nil {
+		return false
+	}
+	return k.collapsedColumns[colIdx]
+}
+
+// ToggleColumnCollapse toggles the collapsed state of a column.
+// Cannot collapse the currently selected column.
+func (k *KanbanBoard) ToggleColumnCollapse(colIdx int) {
+	if k.listMode {
+		// No columns are drawn, so collapsing one would only be a surprise
+		// waiting on the board when the user switches back.
+		return
+	}
+	if colIdx < 0 || colIdx >= len(k.columns) {
+		return
+	}
+	if k.collapsedColumns == nil {
+		k.collapsedColumns = make(map[int]bool)
+	}
+	if k.collapsedColumns[colIdx] {
+		// Uncollapse
+		delete(k.collapsedColumns, colIdx)
+	} else {
+		// Collapse - but move selection away first if needed
+		if k.selectedCol == colIdx {
+			k.moveToNextVisibleColumn(colIdx)
+		}
+		k.collapsedColumns[colIdx] = true
+	}
+}
+
+// visibleColumnCount returns the number of non-collapsed columns.
+func (k *KanbanBoard) visibleColumnCount() int {
+	count := 0
+	for i := range k.columns {
+		if !k.IsColumnCollapsed(i) {
+			count++
+		}
+	}
+	return count
+}
+
+// moveToNextVisibleColumn moves selection to the nearest non-collapsed column.
+func (k *KanbanBoard) moveToNextVisibleColumn(fromCol int) {
+	// Try right first, then left
+	for i := fromCol + 1; i < len(k.columns); i++ {
+		if !k.IsColumnCollapsed(i) {
+			k.selectedCol = i
+			k.clampSelection()
+			k.ensureSelectedVisible()
+			return
+		}
+	}
+	for i := fromCol - 1; i >= 0; i-- {
+		if !k.IsColumnCollapsed(i) {
+			k.selectedCol = i
+			k.clampSelection()
+			k.ensureSelectedVisible()
+			return
+		}
+	}
+}
+
+// distributeTasksToColumns distributes tasks to their respective columns.
+func (k *KanbanBoard) distributeTasksToColumns() {
+	// Clear all columns
+	for i := range k.columns {
+		k.columns[i].Tasks = nil
+	}
+
+	// Distribute tasks to columns
+	for _, task := range k.allTasks {
+		placed := false
+		for i := range k.columns {
+			if k.columns[i].Status == task.Status {
+				k.columns[i].Tasks = append(k.columns[i].Tasks, task)
+				placed = true
+				break
+			}
+		}
+		// Map processing tasks to In Progress column (which uses StatusQueued)
+		if !placed && task.Status == db.StatusProcessing {
+			for i := range k.columns {
+				if k.columns[i].Status == db.StatusQueued {
+					k.columns[i].Tasks = append(k.columns[i].Tasks, task)
+					break
+				}
+			}
+		}
+	}
+
+	// Sort each column so pinned tasks stay at the top
+	for i := range k.columns {
+		k.sortColumnTasks(i)
+	}
+
+	// Ensure selected position is valid
+	k.clampSelection()
+}
+
+// sortColumnTasks keeps pinned tasks at the top of a column while preserving
+// the existing order for everything else.
+func (k *KanbanBoard) sortColumnTasks(colIdx int) {
+	if colIdx < 0 || colIdx >= len(k.columns) {
+		return
+	}
+	tasks := k.columns[colIdx].Tasks
+	if len(tasks) <= 1 {
+		return
+	}
+
+	// Stable sort: pinned tasks stay at top, then everything else in original order
+	var pinned, rest []*db.Task
+	for _, task := range tasks {
+		if task.Pinned {
+			pinned = append(pinned, task)
+			continue
+		}
+		rest = append(rest, task)
+	}
+
+	// Reconstruct the slice with pinned first
+	ordered := append([]*db.Task{}, pinned...)
+	ordered = append(ordered, rest...)
+	k.columns[colIdx].Tasks = ordered
+}
+
+// splitPinnedTasks separates the pinned prefix for a column from the rest.
+// Columns are sorted with pinned tasks first, so we can split once we hit the
+// first non-pinned task.
+func splitPinnedTasks(tasks []*db.Task) (pinned []*db.Task, unpinned []*db.Task) {
+	idx := 0
+	for idx < len(tasks) && tasks[idx].Pinned {
+		idx++
+	}
+	return tasks[:idx], tasks[idx:]
+}
+
+// maxVisibleCards returns how many task cards fit in a column at the current
+// board height. Mirrors the colHeight math used by the view/click handlers so
+// scrolling and rendering agree.
+func (k *KanbanBoard) maxVisibleCards() int {
+	colHeight := k.height - 2 // -2 for column borders
+	if k.IsMobileMode() {
+		colHeight = k.height - 4 // -2 for tab bar, -2 for column borders
+	}
+	m := (colHeight - 3) / cardHeight // -3 for header bar and scroll indicators
+	if m < 1 {
+		m = 1
+	}
+	return m
+}
+
+// columnLayout describes how a column's tasks map onto the viewport.
+type columnLayout struct {
+	fixedPinned    int // leading pinned tasks rendered fixed at the top: rows [0, fixedPinned)
+	scrollCapacity int // number of scrolling-region cards visible at once
+	scrollOffset   int // clamped offset into the scrolling region (region starts at fixedPinned)
+}
+
+// columnLayoutFor computes the viewport layout for a column given how many cards
+// fit (maxVisible). Pinned tasks stay fixed at the top while they leave room to
+// scroll the rest; but once pinned tasks alone fill the viewport they scroll
+// along with everything else (fixedPinned == 0), so the selection can never fall
+// off-screen in an all-pinned column. The scrolling region is col.Tasks[fixedPinned:].
+func (k *KanbanBoard) columnLayoutFor(colIdx, maxVisible int) columnLayout {
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+	col := k.columns[colIdx]
+	// Once pins fill the viewport they all scroll; scanning the rest cannot
+	// change the layout. Keep navigation constant-time even in all-pinned lists.
+	pinnedCount := 0
+	for pinnedCount < len(col.Tasks) && pinnedCount < maxVisible && col.Tasks[pinnedCount].Pinned {
+		pinnedCount++
+	}
+
+	fixedPinned := pinnedCount
+	if pinnedCount >= maxVisible {
+		// Pinned tasks overflow the viewport — there is no room to keep them
+		// fixed, so scroll the whole list instead.
+		fixedPinned = 0
+	}
+	scrollCapacity := maxVisible - fixedPinned
+	if scrollCapacity < 1 {
+		scrollCapacity = 1
+	}
+
+	offset := 0
+	if colIdx >= 0 && colIdx < len(k.scrollOffsets) {
+		offset = k.scrollOffsets[colIdx]
+	}
+	regionLen := len(col.Tasks) - fixedPinned
+	maxOffset := regionLen - scrollCapacity
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return columnLayout{fixedPinned: fixedPinned, scrollCapacity: scrollCapacity, scrollOffset: offset}
+}
+
+// SetSize updates the board dimensions.
+func (k *KanbanBoard) SetSize(width, height int) {
+	heightChanged := k.height != height
+	k.width = width
+	k.height = height
+	// When height changes (e.g. quickview appearing/disappearing),
+	// recalculate scroll offsets so the selected task stays visible
+	if heightChanged {
+		k.ensureListRowVisible()
+		k.ensureSelectedVisible()
+	}
+}
+
+// MoveLeft moves selection to the left column, skipping collapsed columns.
+func (k *KanbanBoard) MoveLeft() {
+	if k.listMode {
+		return // a flat list has no columns to move between
+	}
+	for i := k.selectedCol - 1; i >= 0; i-- {
+		if !k.IsColumnCollapsed(i) {
+			k.selectedCol = i
+			k.clampSelection()
+			k.ensureSelectedVisible()
+			return
+		}
+	}
+}
+
+// MoveRight moves selection to the right column, skipping collapsed columns.
+func (k *KanbanBoard) MoveRight() {
+	if k.listMode {
+		return // a flat list has no columns to move between
+	}
+	for i := k.selectedCol + 1; i < len(k.columns); i++ {
+		if !k.IsColumnCollapsed(i) {
+			k.selectedCol = i
+			k.clampSelection()
+			k.ensureSelectedVisible()
+			return
+		}
+	}
+}
+
+// MoveUp moves selection up within the current column.
+// If at the top, wraps around to the bottom.
+func (k *KanbanBoard) MoveUp() {
+	if k.listMode {
+		k.moveListUp()
+		return
+	}
+	col := k.columns[k.selectedCol]
+	if len(col.Tasks) == 0 {
+		return
+	}
+	if k.selectedRow > 0 {
+		k.selectedRow--
+	} else {
+		// Wrap around to bottom
+		k.selectedRow = len(col.Tasks) - 1
+	}
+	k.ensureSelectedVisible()
+}
+
+// MoveDown moves selection down within the current column.
+// If at the bottom, wraps around to the top.
+func (k *KanbanBoard) MoveDown() {
+	if k.listMode {
+		k.moveListDown()
+		return
+	}
+	col := k.columns[k.selectedCol]
+	if len(col.Tasks) == 0 {
+		return
+	}
+	if k.selectedRow < len(col.Tasks)-1 {
+		k.selectedRow++
+	} else {
+		// Wrap around to top
+		k.selectedRow = 0
+	}
+	k.ensureSelectedVisible()
+}
+
+// JumpToPinned moves selection to the first pinned task in the current column.
+// If there are no pinned tasks, moves to the top of the column.
+func (k *KanbanBoard) JumpToPinned() {
+	if k.listMode {
+		// Pinned tasks sort to the head of the list.
+		k.listRow = 0
+		k.ensureListRowVisible()
+		return
+	}
+	col := k.columns[k.selectedCol]
+	if len(col.Tasks) == 0 {
+		return
+	}
+	// Pinned tasks are always at the top, so just go to row 0
+	// If already at the top, stay there
+	k.selectedRow = 0
+	k.ensureSelectedVisible()
+}
+
+// JumpToUnpinned moves selection to the first unpinned task in the current column.
+// If all tasks are pinned or there are no tasks, stays at current position.
+func (k *KanbanBoard) JumpToUnpinned() {
+	if k.listMode {
+		pinned, unpinned := splitPinnedTasks(k.listTasks)
+		if len(unpinned) == 0 {
+			return
+		}
+		k.listRow = len(pinned)
+		k.ensureListRowVisible()
+		return
+	}
+	col := k.columns[k.selectedCol]
+	if len(col.Tasks) == 0 {
+		return
+	}
+	pinnedTasks, unpinnedTasks := splitPinnedTasks(col.Tasks)
+	if len(unpinnedTasks) == 0 {
+		// No unpinned tasks, stay at current position
+		return
+	}
+	// Jump to the first unpinned task (index equals count of pinned tasks)
+	k.selectedRow = len(pinnedTasks)
+	k.ensureSelectedVisible()
+}
+
+// ensureSelectedVisible adjusts scroll offset so the selected task is visible.
+func (k *KanbanBoard) ensureSelectedVisible() {
+	if k.selectedCol < 0 || k.selectedCol >= len(k.columns) {
+		return
+	}
+
+	// Ensure scrollOffsets slice is properly sized
+	for len(k.scrollOffsets) < len(k.columns) {
+		k.scrollOffsets = append(k.scrollOffsets, 0)
+	}
+
+	lay := k.columnLayoutFor(k.selectedCol, k.maxVisibleCards())
+
+	// Tasks pinned to the fixed header are always visible — don't move scroll.
+	if k.selectedRow < lay.fixedPinned {
+		k.scrollOffsets[k.selectedCol] = lay.scrollOffset
+		return
+	}
+
+	// Scroll the region so the selected task is within the visible window.
+	col := k.columns[k.selectedCol]
+	relIndex := k.selectedRow - lay.fixedPinned
+	offset := lay.scrollOffset
+	if relIndex < offset {
+		offset = relIndex
+	} else if relIndex >= offset+lay.scrollCapacity {
+		offset = relIndex - lay.scrollCapacity + 1
+	}
+
+	regionLen := len(col.Tasks) - lay.fixedPinned
+	maxOffset := regionLen - lay.scrollCapacity
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	k.scrollOffsets[k.selectedCol] = offset
+}
+
+// clampSelection ensures selection is within bounds.
+func (k *KanbanBoard) clampSelection() {
+	if k.selectedCol >= len(k.columns) {
+		k.selectedCol = len(k.columns) - 1
+	}
+	if k.selectedCol < 0 {
+		k.selectedCol = 0
+	}
+
+	col := k.columns[k.selectedCol]
+	if k.selectedRow >= len(col.Tasks) {
+		k.selectedRow = len(col.Tasks) - 1
+	}
+	if k.selectedRow < 0 {
+		k.selectedRow = 0
+	}
+}
+
+// SelectedTask returns the currently selected task.
+func (k *KanbanBoard) SelectedTask() *db.Task {
+	if k.listMode {
+		return k.selectedListTask()
+	}
+	if k.selectedCol >= len(k.columns) {
+		return nil
+	}
+	col := k.columns[k.selectedCol]
+	if k.selectedRow >= len(col.Tasks) || k.selectedRow < 0 {
+		return nil
+	}
+	return col.Tasks[k.selectedRow]
+}
+
+// SelectTask selects a task by ID.
+func (k *KanbanBoard) SelectTask(id int64) bool {
+	// Move both cursors: whichever mode is active now, the other one must land
+	// on the same task when the user toggles.
+	foundInList := k.selectListTask(id)
+	for colIdx, col := range k.columns {
+		for rowIdx, task := range col.Tasks {
+			if task.ID == id {
+				k.selectedCol = colIdx
+				k.selectedRow = rowIdx
+				k.ensureSelectedVisible()
+				return true
+			}
+		}
+	}
+	return foundInList
+}
+
+// IsEmpty returns true if all columns have no tasks.
+func (k *KanbanBoard) IsEmpty() bool {
+	if k.listMode {
+		return len(k.listTasks) == 0
+	}
+	for _, col := range k.columns {
+		if len(col.Tasks) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// TotalTaskCount returns the total number of tasks across all columns.
+func (k *KanbanBoard) TotalTaskCount() int {
+	if k.listMode {
+		return len(k.listTasks)
+	}
+	count := 0
+	for _, col := range k.columns {
+		count += len(col.Tasks)
+	}
+	return count
+}
+
+// View renders the kanban board.
+//
+// View is called on every Bubble Tea Update — including periodic ticks, mouse
+// motion, and task events that don't change the board — so it is the single
+// hottest path in the TUI. We compute a signature over every input that affects
+// the rendered output and return the previously rendered string when nothing has
+// changed, turning idle re-renders into a cheap hash instead of a full lipgloss
+// layout pass.
+func (k *KanbanBoard) View() string {
+	if k.width < 40 || k.height < 10 {
+		// Tiny, cheap to render; not worth caching.
+		return lipgloss.Place(k.width, k.height, lipgloss.Center, lipgloss.Center, "Terminal too small")
+	}
+
+	sig := k.renderSignature()
+	if k.cachedViewOK && k.cachedViewSig == sig {
+		return k.cachedView
+	}
+
+	var out string
+	switch {
+	case k.listMode:
+		// One flat line per task — the same in a narrow terminal as a wide one.
+		out = k.viewList()
+	case k.IsMobileMode():
+		// Use single-column view for narrow terminals.
+		out = k.viewMobile()
+	default:
+		out = k.viewDesktop()
+	}
+
+	k.cachedView = out
+	k.cachedViewSig = sig
+	k.cachedViewOK = true
+	return out
+}
+
+// FNV-1a constants for the allocation-free render signature.
+const (
+	fnvOffset64 uint64 = 14695981039346656037
+	fnvPrime64  uint64 = 1099511628211
+)
+
+// sigHasher is a tiny, stack-allocated FNV-1a hasher used to build the render
+// signature without allocating (unlike hash/fnv, which heap-allocates the hasher).
+type sigHasher struct{ h uint64 }
+
+func newSigHasher() sigHasher { return sigHasher{h: fnvOffset64} }
+
+func (s *sigHasher) byte(b byte) {
+	s.h ^= uint64(b)
+	s.h *= fnvPrime64
+}
+
+func (s *sigHasher) str(v string) {
+	for i := 0; i < len(v); i++ {
+		s.byte(v[i])
+	}
+	s.byte(0) // separator so "ab"+"c" != "a"+"bc"
+}
+
+func (s *sigHasher) u64(v uint64) {
+	for i := 0; i < 8; i++ {
+		s.byte(byte(v >> (uint(i) * 8)))
+	}
+}
+
+func (s *sigHasher) int(v int) { s.u64(uint64(v)) }
+func (s *sigHasher) boolean(b bool) {
+	if b {
+		s.byte(1)
+	} else {
+		s.byte(0)
+	}
+}
+
+// renderSignature hashes inputs that affect the current viewport. Off-screen
+// cards cannot change its pixels; their current state is hashed when scrolled in.
+//
+// IMPORTANT: when adding a new field to renderTaskCard / viewDesktop / viewMobile
+// that changes what is drawn, add it here too, or the render cache will show stale
+// output. Themed colours are covered globally by StyleGeneration().
+func (k *KanbanBoard) renderSignature() uint64 {
+	h := newSigHasher()
+	h.u64(StyleGeneration()) // any themed/project colour change
+	h.int(k.width)
+	h.int(k.height)
+	h.int(k.selectedCol)
+	h.int(k.selectedRow)
+	h.int(k.hiddenDoneCount)
+	h.boolean(IsGlobalDangerousMode())
+	h.boolean(k.listMode)
+	h.int(k.listRow)
+	h.int(k.listScroll)
+	h.str(k.listTitle)
+
+	for _, off := range k.scrollOffsets {
+		h.int(off)
+	}
+	for i := range k.columns {
+		h.boolean(k.IsColumnCollapsed(i))
+	}
+
+	for ci := range k.columns {
+		col := &k.columns[ci]
+		h.str(col.Status)
+		h.str(col.Title)
+		h.str(string(col.Color))
+		h.str(col.Icon)
+		h.int(len(col.Tasks))
+		if (k.IsMobileMode() && ci != k.selectedCol) || (!k.IsMobileMode() && k.IsColumnCollapsed(ci)) {
+			continue
+		}
+		lay := k.columnLayoutFor(ci, k.maxVisibleCards())
+		h.int(lay.fixedPinned)
+		for _, t := range col.Tasks[:lay.fixedPinned] {
+			k.hashTaskCard(&h, t)
+		}
+		start := lay.fixedPinned + lay.scrollOffset
+		end := min(start+lay.scrollCapacity, len(col.Tasks))
+		for _, t := range col.Tasks[start:end] {
+			k.hashTaskCard(&h, t)
+		}
+	}
+	return h.h
+}
+
+// hashTaskCard mirrors every field renderTaskCard reads for a single task.
+func (k *KanbanBoard) hashTaskCard(h *sigHasher, t *db.Task) {
+	h.u64(uint64(t.ID))
+	h.str(t.Status)
+	h.str(t.Project)
+	h.str(t.Title)
+	h.str(t.Summary)
+	h.boolean(t.Pinned)
+	h.str(t.PlacementTarget)
+	h.boolean(t.IsDangerous())
+	h.boolean(t.IsAutoPermission())
+	h.boolean(t.IsAcceptEdits())
+	h.boolean(k.HasRunningProcess(t.ID))
+	h.boolean(k.NeedsInput(t.ID))
+	h.int(k.GetOpenBlockerCount(t.ID))
+	if pr := k.prInfo[t.ID]; pr != nil {
+		h.boolean(true)
+		h.str(string(pr.State))
+		h.str(string(pr.CheckState))
+		h.str(pr.Mergeable)
+		h.int(pr.Additions)
+		h.int(pr.Deletions)
+	} else {
+		h.boolean(false)
+	}
+	// Per-card sub-line inputs: the agent's latest activity and an elapsed
+	// bucket that ticks the age hint each minute.
+	if log := k.latestActivity[t.ID]; log != nil {
+		h.boolean(true)
+		h.str(log.Content)
+	} else {
+		h.boolean(false)
+	}
+	h.int(taskElapsedMinutes(t))
+	// Workflow lead cards render the goal + step progress instead of the raw
+	// title/sub-line, so the workflow's shape must feed the signature or the card
+	// caches serve a stale badge as the workflow advances.
+	if g := k.workflowGroup(t.ID); g != nil {
+		h.boolean(true)
+		h.str(g.Goal())
+		h.str(g.StepLabel())
+		h.int(g.DoneCount())
+		h.int(g.Total())
+	} else {
+		h.boolean(false)
+	}
+}
+
+// collapsedColumnWidth is the fixed width for collapsed column strips.
+const collapsedColumnWidth = 3
+
+// viewDesktop renders the full kanban board with all columns side by side.
+func (k *KanbanBoard) viewDesktop() string {
+	numCols := len(k.columns)
+
+	// Count collapsed columns and their total width
+	collapsedCount := 0
+	for i := range k.columns {
+		if k.IsColumnCollapsed(i) {
+			collapsedCount++
+		}
+	}
+	expandedCount := numCols - collapsedCount
+
+	// Calculate column width for expanded columns
+	// Account for borders (2 chars per column) and gaps between columns (1 char each)
+	collapsedTotalWidth := collapsedCount * (collapsedColumnWidth + 2 + 1) // width + borders + gap
+	availableWidth := k.width - (expandedCount * 2) - (numCols - 1) - collapsedTotalWidth
+	colWidth := availableWidth / expandedCount
+	if colWidth < 20 {
+		colWidth = 20
+	}
+
+	// Calculate available height for tasks
+	// Subtract 2: 1 for header bar + 1 for bottom border of column
+	colHeight := k.height - 2
+
+	// Build columns
+	var columnViews []string
+	for colIdx, col := range k.columns {
+		isSelectedCol := colIdx == k.selectedCol
+
+		// Render collapsed column as a thin vertical strip
+		if k.IsColumnCollapsed(colIdx) {
+			columnView := k.renderCollapsedColumn(colIdx, col, colHeight)
+			columnViews = append(columnViews, columnView)
+			continue
+		}
+
+		// Colored header bar at top of column
+		// Width matches the column content width (will be inside the border)
+		headerBarStyle := lipgloss.NewStyle().
+			Width(colWidth).
+			Background(col.Color).
+			Foreground(lipgloss.Color("#000000")).
+			Bold(true).
+			Align(lipgloss.Center)
+
+		headerText := fmt.Sprintf("%s %s (%d)", col.Icon, col.Title, len(col.Tasks))
+		headerBar := headerBarStyle.Render(headerText)
+
+		// Task cards - calculate how many fit
+		maxTasks := (colHeight - 3) / cardHeight // -3 for scroll indicators and padding
+		if maxTasks < 1 {
+			maxTasks = 1
+		}
+
+		lay := k.columnLayoutFor(colIdx, maxTasks)
+		regionStart := lay.fixedPinned + lay.scrollOffset
+		regionEnd := regionStart + lay.scrollCapacity
+		if regionEnd > len(col.Tasks) {
+			regionEnd = len(col.Tasks)
+		}
+
+		var taskViews []string
+
+		// Render pinned tasks fixed at the top (when they fit)
+		for i := 0; i < lay.fixedPinned; i++ {
+			isSelected := isSelectedCol && i == k.selectedRow
+			taskViews = append(taskViews, k.renderTaskCard(col.Tasks[i], colWidth, isSelected))
+		}
+
+		// Show "more above" indicator for the scrolling region
+		if lay.scrollOffset > 0 {
+			scrollIndicatorStyle := lipgloss.NewStyle().
+				Foreground(ColorMuted).
+				Width(colWidth - 2).
+				Align(lipgloss.Center).
+				Italic(true)
+			taskViews = append(taskViews, scrollIndicatorStyle.Render(fmt.Sprintf("%s %d more", IconArrowUp(), lay.scrollOffset)))
+		}
+
+		// Render visible scrolling-region tasks
+		for i := regionStart; i < regionEnd; i++ {
+			isSelected := isSelectedCol && i == k.selectedRow
+			taskViews = append(taskViews, k.renderTaskCard(col.Tasks[i], colWidth, isSelected))
+		}
+
+		// Show "more below" indicator (combined with hidden done count for Done column)
+		remainingBelow := len(col.Tasks) - regionEnd
+		isDoneCol := col.Status == db.StatusDone
+		hasHiddenDone := isDoneCol && k.hiddenDoneCount > 0
+
+		if remainingBelow > 0 || hasHiddenDone {
+			scrollIndicatorStyle := lipgloss.NewStyle().
+				Foreground(ColorMuted).
+				Width(colWidth - 2).
+				Align(lipgloss.Center).
+				Italic(true)
+
+			var indicatorText string
+			if remainingBelow > 0 && hasHiddenDone {
+				indicatorText = fmt.Sprintf("%s %d more (+%d older)", IconArrowDown(), remainingBelow, k.hiddenDoneCount)
+			} else if remainingBelow > 0 {
+				indicatorText = fmt.Sprintf("%s %d more", IconArrowDown(), remainingBelow)
+			} else {
+				indicatorText = fmt.Sprintf("+%d older (Ctrl+P)", k.hiddenDoneCount)
+			}
+			taskViews = append(taskViews, scrollIndicatorStyle.Render(indicatorText))
+		}
+
+		// Empty column placeholder with contextual message
+		if len(col.Tasks) == 0 {
+			emptyStyle := lipgloss.NewStyle().
+				Foreground(ColorMuted).
+				Width(colWidth - 2).
+				Align(lipgloss.Center).
+				Italic(true).
+				MarginTop(1)
+			emptyMsg := emptyColumnMessage(col.Status)
+			taskViews = append(taskViews, emptyStyle.Render(emptyMsg))
+		}
+
+		// Combine tasks with spacing
+		taskContent := lipgloss.JoinVertical(lipgloss.Left, taskViews...)
+
+		// Column container with subtle rounded border
+		normalBorder, highlightBorder := GetThemeBorderColors()
+		borderColor := normalBorder
+		borderStyle := lipgloss.RoundedBorder()
+		if isSelectedCol {
+			borderColor = highlightBorder
+		}
+
+		// Combine header and tasks, then wrap with border
+		// Header is inside the border so they align perfectly
+		fullContent := lipgloss.JoinVertical(lipgloss.Left,
+			headerBar,
+			taskContent,
+		)
+
+		colStyle := lipgloss.NewStyle().
+			Width(colWidth).
+			Height(colHeight). // Full height including header
+			Border(borderStyle).
+			BorderForeground(borderColor)
+
+		columnView := colStyle.Render(fullContent)
+
+		columnViews = append(columnViews, columnView)
+	}
+
+	// Join columns horizontally with gap
+	gapStyle := lipgloss.NewStyle().Width(1)
+	var parts []string
+	for i, cv := range columnViews {
+		parts = append(parts, cv)
+		if i < len(columnViews)-1 {
+			parts = append(parts, gapStyle.Render(" "))
+		}
+	}
+	board := lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+
+	return board
+}
+
+// renderCollapsedColumn renders a collapsed column as a thin vertical strip
+// showing the column icon and task count vertically.
+func (k *KanbanBoard) renderCollapsedColumn(colIdx int, col KanbanColumn, colHeight int) string {
+	normalBorder, _ := GetThemeBorderColors()
+
+	// Build vertical content: icon on top, then count
+	var lines []string
+	lines = append(lines, col.Icon)
+	countStr := fmt.Sprintf("%d", len(col.Tasks))
+	lines = append(lines, countStr)
+
+	content := lipgloss.JoinVertical(lipgloss.Center, lines...)
+
+	contentStyle := lipgloss.NewStyle().
+		Width(collapsedColumnWidth).
+		Height(colHeight).
+		Foreground(col.Color).
+		Align(lipgloss.Center).
+		AlignVertical(lipgloss.Center)
+
+	colStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(normalBorder)
+
+	return colStyle.Render(contentStyle.Render(content))
+}
+
+// viewMobile renders a single-column view with tab navigation for narrow terminals.
+func (k *KanbanBoard) viewMobile() string {
+	// Render tab bar for column navigation
+	tabBar := k.renderColumnTabs()
+
+	// Use full width for single column (minus borders)
+	colWidth := k.width - 2
+	if colWidth < 20 {
+		colWidth = 20
+	}
+
+	// Calculate available height for tasks (subtract tab bar height and column border)
+	tabBarHeight := 2 // Tab bar takes 2 lines (content + margin)
+	colHeight := k.height - tabBarHeight - 2
+
+	col := k.columns[k.selectedCol]
+
+	// Colored header bar at top of column
+	headerBarStyle := lipgloss.NewStyle().
+		Width(colWidth).
+		Background(col.Color).
+		Foreground(lipgloss.Color("#000000")).
+		Bold(true).
+		Align(lipgloss.Center)
+
+	headerText := fmt.Sprintf("%s %s (%d)", col.Icon, col.Title, len(col.Tasks))
+	headerBar := headerBarStyle.Render(headerText)
+
+	// Task cards - calculate how many fit
+	maxTasks := (colHeight - 3) / cardHeight
+	if maxTasks < 1 {
+		maxTasks = 1
+	}
+
+	lay := k.columnLayoutFor(k.selectedCol, maxTasks)
+	regionStart := lay.fixedPinned + lay.scrollOffset
+	regionEnd := regionStart + lay.scrollCapacity
+	if regionEnd > len(col.Tasks) {
+		regionEnd = len(col.Tasks)
+	}
+
+	var taskViews []string
+
+	// Render pinned tasks fixed at the top (when they fit)
+	for i := 0; i < lay.fixedPinned; i++ {
+		isSelected := i == k.selectedRow
+		taskViews = append(taskViews, k.renderTaskCard(col.Tasks[i], colWidth, isSelected))
+	}
+
+	// Show "more above" indicator for the scrolling region
+	if lay.scrollOffset > 0 {
+		scrollIndicatorStyle := lipgloss.NewStyle().
+			Foreground(ColorMuted).
+			Width(colWidth - 2).
+			Align(lipgloss.Center).
+			Italic(true)
+		taskViews = append(taskViews, scrollIndicatorStyle.Render(fmt.Sprintf("%s %d more", IconArrowUp(), lay.scrollOffset)))
+	}
+
+	// Render visible scrolling-region tasks
+	for i := regionStart; i < regionEnd; i++ {
+		isSelected := i == k.selectedRow
+		taskViews = append(taskViews, k.renderTaskCard(col.Tasks[i], colWidth, isSelected))
+	}
+
+	// Show "more below" indicator (combined with hidden done count for Done column)
+	remainingBelow := len(col.Tasks) - regionEnd
+	isDoneCol := col.Status == db.StatusDone
+	hasHiddenDone := isDoneCol && k.hiddenDoneCount > 0
+
+	if remainingBelow > 0 || hasHiddenDone {
+		scrollIndicatorStyle := lipgloss.NewStyle().
+			Foreground(ColorMuted).
+			Width(colWidth - 2).
+			Align(lipgloss.Center).
+			Italic(true)
+
+		var indicatorText string
+		if remainingBelow > 0 && hasHiddenDone {
+			indicatorText = fmt.Sprintf("%s %d more (+%d older)", IconArrowDown(), remainingBelow, k.hiddenDoneCount)
+		} else if remainingBelow > 0 {
+			indicatorText = fmt.Sprintf("%s %d more", IconArrowDown(), remainingBelow)
+		} else {
+			indicatorText = fmt.Sprintf("+%d older (Ctrl+P)", k.hiddenDoneCount)
+		}
+		taskViews = append(taskViews, scrollIndicatorStyle.Render(indicatorText))
+	}
+
+	// Empty column placeholder with contextual message
+	if len(col.Tasks) == 0 {
+		emptyStyle := lipgloss.NewStyle().
+			Foreground(ColorMuted).
+			Width(colWidth - 2).
+			Align(lipgloss.Center).
+			Italic(true).
+			MarginTop(1)
+		emptyMsg := emptyColumnMessage(col.Status)
+		taskViews = append(taskViews, emptyStyle.Render(emptyMsg))
+	}
+
+	// Combine tasks with spacing
+	taskContent := lipgloss.JoinVertical(lipgloss.Left, taskViews...)
+
+	// Column container with subtle rounded border
+	_, highlightBorder := GetThemeBorderColors()
+	borderStyle := lipgloss.RoundedBorder()
+
+	fullContent := lipgloss.JoinVertical(lipgloss.Left,
+		headerBar,
+		taskContent,
+	)
+
+	colStyle := lipgloss.NewStyle().
+		Width(colWidth).
+		Height(colHeight).
+		Border(borderStyle).
+		BorderForeground(highlightBorder)
+
+	columnView := colStyle.Render(fullContent)
+
+	// Combine tab bar and column
+	return lipgloss.JoinVertical(lipgloss.Left, tabBar, columnView)
+}
+
+// renderColumnTabs renders the tab bar for mobile column navigation.
+func (k *KanbanBoard) renderColumnTabs() string {
+	var tabs []string
+
+	for i, col := range k.columns {
+		isSelected := i == k.selectedCol
+
+		// Calculate tab width to fit all tabs
+		tabWidth := (k.width - len(k.columns) - 1) / len(k.columns)
+		if tabWidth < 8 {
+			tabWidth = 8
+		}
+
+		// Short column names for mobile
+		name := col.Icon
+		switch col.Title {
+		case ColumnTitles[0]:
+			name += " Back"
+		case ColumnTitles[1]:
+			name += " Prog"
+		case ColumnTitles[2]:
+			name += " Block"
+		case ColumnTitles[3]:
+			name += " Done"
+		default:
+			name += " " + col.Title
+		}
+
+		// Add task count
+		name += fmt.Sprintf(" %d", len(col.Tasks))
+
+		tabStyle := lipgloss.NewStyle().
+			Width(tabWidth).
+			Align(lipgloss.Center).
+			Padding(0, 0)
+
+		if isSelected {
+			// Selected tab uses a simple color highlight
+			tabStyle = tabStyle.
+				Foreground(col.Color).
+				Bold(true)
+		} else {
+			// Unselected tabs are dimmed
+			tabStyle = tabStyle.
+				Foreground(ColorMuted)
+		}
+
+		tabs = append(tabs, tabStyle.Render(name))
+	}
+
+	// Join tabs with separator
+	tabBar := lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
+
+	// Add a subtle bottom border
+	tabBarStyle := lipgloss.NewStyle().
+		Width(k.width).
+		MarginBottom(1)
+
+	return tabBarStyle.Render(tabBar)
+}
+
+// renderTaskCard renders a single task card.
+func (k *KanbanBoard) renderTaskCard(task *db.Task, width int, isSelected bool) string {
+	if width < 10 {
+		width = 10
+	}
+
+	// Per-card render cache: hash everything that affects this card's output and
+	// reuse the previous render on a hit. Uses the same hashTaskCard inputs as the
+	// board signature so the two caches stay consistent by construction.
+	keyHasher := newSigHasher()
+	keyHasher.int(width)
+	keyHasher.boolean(isSelected)
+	keyHasher.u64(StyleGeneration())
+	k.hashTaskCard(&keyHasher, task)
+	cardKey := keyHasher.h
+	if cached, ok := k.cardCache[cardKey]; ok {
+		return cached
+	}
+
+	var b strings.Builder
+
+	// Task ID with status indicator.
+	statusIcon := StatusIcon(task.Status)
+	if isSelected {
+		b.WriteString(statusIcon)
+		b.WriteString(" ")
+		b.WriteString(fmt.Sprintf("#%d", task.ID))
+	} else {
+		b.WriteString(FgStyle(StatusColor(task.Status)).Render(statusIcon))
+		b.WriteString(" ")
+		b.WriteString(Dim.Render(fmt.Sprintf("#%d", task.ID)))
+	}
+
+	// Project tag
+	if task.Project != "" {
+		shortProject := task.Project
+		switch task.Project {
+		case "offerlab":
+			shortProject = "ol"
+		case "influencekit":
+			shortProject = "ik"
+		}
+		if isSelected {
+			b.WriteString(" [" + shortProject + "]")
+		} else {
+			b.WriteString(" ")
+			b.WriteString(FgStyle(ProjectColor(task.Project)).Render("[" + shortProject + "]"))
+		}
+	}
+
+	// Status indicators (right-aligned)
+	var indicators []string
+	if prInfo := k.prInfo[task.ID]; prInfo != nil {
+		// Show diff stats first (like Conductor)
+		if diffStats := PRDiffStats(prInfo); diffStats != "" {
+			if isSelected {
+				indicators = append(indicators, PRDiffStatsPlain(prInfo))
+			} else {
+				indicators = append(indicators, diffStats)
+			}
+		}
+		// Then PR status badge
+		if isSelected {
+			indicators = append(indicators, PRStatusIcon(prInfo))
+		} else {
+			indicators = append(indicators, PRStatusBadge(prInfo))
+		}
+	}
+	if k.HasRunningProcess(task.ID) {
+		if isSelected {
+			indicators = append(indicators, "●")
+		} else {
+			indicators = append(indicators, FgStyle(lipgloss.Color("46")).Render("●")) // Bright green
+		}
+	}
+	// Dangerous mode indicator (red dot) - only shown when:
+	// - Task is in dangerous mode
+	// - Task is active (processing or blocked)
+	// - System is NOT in global dangerous mode (otherwise the global banner is shown)
+	if task.IsDangerous() && (task.Status == db.StatusProcessing || task.Status == db.StatusBlocked) && !IsGlobalDangerousMode() {
+		if isSelected {
+			indicators = append(indicators, "●")
+		} else {
+			indicators = append(indicators, FgStyle(ColorDangerous).Render("●"))
+		}
+	}
+	// Auto-mode indicator (yellow dot) for active tasks running in Claude Code's
+	// auto mode — matches Claude's own "auto mode on" status color.
+	if task.IsAutoPermission() && (task.Status == db.StatusProcessing || task.Status == db.StatusBlocked) {
+		if isSelected {
+			indicators = append(indicators, "●")
+		} else {
+			indicators = append(indicators, FgStyle(ColorWarning).Render("●"))
+		}
+	}
+	// Accept-edits indicator (violet dot) for active tasks running in Claude's
+	// acceptEdits mode — matches Claude's own "accept edits on" status color.
+	if task.IsAcceptEdits() && (task.Status == db.StatusProcessing || task.Status == db.StatusBlocked) {
+		if isSelected {
+			indicators = append(indicators, "●")
+		} else {
+			indicators = append(indicators, FgStyle(ColorCode).Render("●"))
+		}
+	}
+	// Host badge for a task a placement handler sent elsewhere. Absent — and so
+	// invisible — for every task that ran on this machine. Once tasks run on four
+	// machines, a suite that only fails on one of them is indistinguishable from a
+	// real bug unless the card says which machine produced the result.
+	if host := task.PlacementTarget; host != "" {
+		badge := "@" + host
+		if isSelected {
+			indicators = append(indicators, badge)
+		} else {
+			indicators = append(indicators, FgStyle(ColorCode).Render(badge))
+		}
+	}
+	if task.Pinned {
+		if isSelected {
+			indicators = append(indicators, IconPin())
+		} else {
+			indicators = append(indicators, FgStyle(ColorWarning).Render(IconPin()))
+		}
+	}
+	// Dependency blocker indicator (lock icon)
+	blockerCount := k.GetOpenBlockerCount(task.ID)
+	if blockerCount > 0 {
+		lockStyle := FgStyle(lipgloss.Color("#F59E0B")) // Orange/amber
+		b.WriteString(" ")
+		if blockerCount == 1 {
+			b.WriteString(lockStyle.Render("🔒"))
+		} else {
+			b.WriteString(lockStyle.Render(fmt.Sprintf("🔒%d", blockerCount)))
+		}
+	}
+
+	// Title (truncate if needed). Workflow lead cards show the goal with a "⇄"
+	// marker in place of the "[Step] goal" step title, so one card stands for the
+	// whole workflow.
+	wf := k.workflowGroup(task.ID)
+	title := task.Title
+	if wf != nil {
+		title = "⇄ " + wf.Goal()
+	}
+	maxTitleLen := width - 4
+	if maxTitleLen < 10 {
+		maxTitleLen = 10
+	}
+	// ansi.Truncate measures display columns and never cuts inside a rune. The
+	// old form sliced by BYTES: a title carrying any multi-byte character (a "·"
+	// in a digest title, an accent, an emoji) could be cut mid-rune, leaving a
+	// dangling byte. The terminal and lipgloss then disagreed about the line's
+	// width, so the card's background and border stopped short of the column.
+	// ansi.Truncate measures display columns and never cuts inside a rune. The
+	// old form sliced by BYTES: a title carrying any multi-byte character (a "·"
+	// in a digest title, an accent, an emoji) could be cut mid-rune, leaving a
+	// dangling byte. The terminal and lipgloss then disagreed about the line's
+	// width, so the card's background and border stopped short of the column.
+	title = ansi.Truncate(title, maxTitleLen, "…")
+
+	leftLine := b.String()
+	indicatorText := strings.Join(indicators, " ")
+
+	lineWidth := width - 2 // account for horizontal padding
+	if lineWidth < 10 {
+		lineWidth = 10
+	}
+
+	idLine := leftLine
+	if indicatorText != "" {
+		space := lineWidth - lipgloss.Width(leftLine) - lipgloss.Width(indicatorText)
+		if space < 1 {
+			available := lineWidth - lipgloss.Width(indicatorText) - 1
+			if available < 4 {
+				available = 4
+			}
+			leftLine = lipgloss.NewStyle().MaxWidth(available).Render(leftLine)
+			space = 1
+		}
+		idLine = leftLine + strings.Repeat(" ", space) + indicatorText
+	}
+	titleLine := title
+
+	// Card style with bottom margin for separation
+	cardStyle := lipgloss.NewStyle().
+		Width(width).
+		Padding(0, 1).
+		MarginBottom(1)
+
+	// Check if task has an active input notification
+	needsInput := k.NeedsInput(task.ID)
+
+	if isSelected {
+		cardBg, cardFg := GetThemeCardColors()
+		// Selected card uses a soft background highlight (no extra borders)
+		cardStyle = cardStyle.
+			Bold(true).
+			Background(cardBg).
+			Foreground(cardFg)
+	} else if needsInput {
+		// Subtle warning tint for tasks needing input
+		cardStyle = cardStyle.Foreground(ColorWarning)
+	}
+
+	subLine := k.cardSubLine(task, width, isSelected)
+	if wf != nil {
+		// Replace the per-task activity line with workflow progress: the current
+		// step (or "Review ∥" during the parallel fan-out) and steps completed.
+		badge := fmt.Sprintf("%s · %d/%d", wf.StepLabel(), wf.DoneCount(), wf.Total())
+		if isSelected {
+			subLine = badge
+		} else {
+			subLine = Dim.Render(badge)
+		}
+	}
+	content := idLine + "\n" + titleLine + "\n" + subLine
+	rendered := cardStyle.Render(content)
+
+	if k.cardCache == nil || len(k.cardCache) >= cardCacheMax {
+		k.cardCache = make(map[uint64]string, 128)
+	}
+	k.cardCache[cardKey] = rendered
+	return rendered
+}
+
+// FocusColumn moves selection to a specific column by index.
+// If the column is collapsed, it will be uncollapsed first.
+func (k *KanbanBoard) FocusColumn(colIdx int) {
+	if k.listMode {
+		// The status keys still mean something in a flat list: jump to the first
+		// task with that status instead of focusing a column that isn't drawn.
+		if colIdx >= 0 && colIdx < len(k.columns) {
+			k.jumpListToStatus(k.columns[colIdx].Status)
+		}
+		return
+	}
+	if colIdx >= 0 && colIdx < len(k.columns) {
+		// Uncollapse the column if it's collapsed
+		if k.IsColumnCollapsed(colIdx) {
+			delete(k.collapsedColumns, colIdx)
+		}
+		k.selectedCol = colIdx
+		k.clampSelection()
+		k.ensureSelectedVisible()
+	}
+}
+
+// ColumnCount returns the number of columns.
+func (k *KanbanBoard) ColumnCount() int {
+	return len(k.columns)
+}
+
+// GetTaskPosition returns the position of the currently selected task in its column.
+// Returns (position, total) where position is 1-indexed, or (0, 0) if no task is selected.
+func (k *KanbanBoard) GetTaskPosition() (int, int) {
+	if k.listMode {
+		if len(k.listTasks) == 0 || k.listRow < 0 || k.listRow >= len(k.listTasks) {
+			return 0, 0
+		}
+		return k.listRow + 1, len(k.listTasks)
+	}
+	if k.selectedCol < 0 || k.selectedCol >= len(k.columns) {
+		return 0, 0
+	}
+	col := k.columns[k.selectedCol]
+	if len(col.Tasks) == 0 || k.selectedRow < 0 || k.selectedRow >= len(col.Tasks) {
+		return 0, 0
+	}
+	return k.selectedRow + 1, len(col.Tasks) // 1-indexed position
+}
+
+// HasPrevTask returns true if there is a previous task in the current column.
+// Returns false if already at the first task or no tasks exist.
+func (k *KanbanBoard) HasPrevTask() bool {
+	if k.listMode {
+		return len(k.listTasks) > 1 && k.listRow > 0
+	}
+	if k.selectedCol < 0 || k.selectedCol >= len(k.columns) {
+		return false
+	}
+	col := k.columns[k.selectedCol]
+	if len(col.Tasks) <= 1 {
+		return false // Only one or no tasks, no prev
+	}
+	return k.selectedRow > 0
+}
+
+// HasNextTask returns true if there is a next task in the current column.
+// Returns false if already at the last task or no tasks exist.
+func (k *KanbanBoard) HasNextTask() bool {
+	if k.listMode {
+		return len(k.listTasks) > 1 && k.listRow < len(k.listTasks)-1
+	}
+	if k.selectedCol < 0 || k.selectedCol >= len(k.columns) {
+		return false
+	}
+	col := k.columns[k.selectedCol]
+	if len(col.Tasks) <= 1 {
+		return false // Only one or no tasks, no next
+	}
+	return k.selectedRow < len(col.Tasks)-1
+}
+
+// HandleClick handles a mouse click at the given coordinates.
+// Returns the clicked task if a task card was clicked, nil otherwise.
+// Also updates the selection to the clicked task.
+func (k *KanbanBoard) HandleClick(x, y int) *db.Task {
+	if k.width < 40 || k.height < 10 {
+		return nil
+	}
+
+	if k.listMode {
+		return k.handleClickList(x, y)
+	}
+
+	// Use mobile click handling for narrow terminals
+	if k.IsMobileMode() {
+		return k.handleClickMobile(x, y)
+	}
+
+	return k.handleClickDesktop(x, y)
+}
+
+// handleClickDesktop handles clicks in desktop (multi-column) mode.
+func (k *KanbanBoard) handleClickDesktop(x, y int) *db.Task {
+	// Calculate column layout (same as viewDesktop()) accounting for collapsed columns
+	numCols := len(k.columns)
+	collapsedCount := 0
+	for i := range k.columns {
+		if k.IsColumnCollapsed(i) {
+			collapsedCount++
+		}
+	}
+	expandedCount := numCols - collapsedCount
+
+	collapsedTotalWidth := collapsedCount * (collapsedColumnWidth + 2 + 1)
+	availableWidth := k.width - (expandedCount * 2) - (numCols - 1) - collapsedTotalWidth
+	colWidth := availableWidth / expandedCount
+	if colWidth < 20 {
+		colWidth = 20
+	}
+
+	// Determine which column was clicked by walking column positions
+	currentX := 0
+	colIdx := -1
+	for i := range k.columns {
+		var thisColTotalWidth int
+		if k.IsColumnCollapsed(i) {
+			thisColTotalWidth = collapsedColumnWidth + 2
+		} else {
+			thisColTotalWidth = colWidth + 2
+		}
+
+		if x >= currentX && x < currentX+thisColTotalWidth {
+			colIdx = i
+			break
+		}
+		currentX += thisColTotalWidth + 1 // +1 for gap
+	}
+
+	if colIdx < 0 {
+		return nil
+	}
+
+	// If clicked on a collapsed column, uncollapse it
+	if k.IsColumnCollapsed(colIdx) {
+		k.FocusColumn(colIdx) // This uncollapses and focuses
+		return nil
+	}
+
+	// Check if click is within column bounds (not on border)
+	colStartX := 0
+	for i := 0; i < colIdx; i++ {
+		if k.IsColumnCollapsed(i) {
+			colStartX += collapsedColumnWidth + 2 + 1
+		} else {
+			colStartX += colWidth + 2 + 1
+		}
+	}
+	relX := x - colStartX
+	if relX < 1 || relX > colWidth {
+		// Clicked on border
+		return nil
+	}
+
+	// Calculate Y position within column
+	// Column structure: 1 border line at top, then header (1 line), then task cards
+	headerLines := 1 // Header bar is 1 line with no margin
+
+	// relY is position within the column content (after top border)
+	relY := y - 1 // -1 for top border
+
+	// Skip header area
+	taskAreaY := relY - headerLines
+	if taskAreaY < 0 {
+		// Clicked on header
+		return nil
+	}
+
+	// Calculate which task was clicked
+	col := k.columns[colIdx]
+	colHeight := k.height - 2                // -2 for column borders (top + bottom)
+	maxTasks := (colHeight - 3) / cardHeight // -3 for header bar and scroll indicators
+	if maxTasks < 1 {
+		maxTasks = 1
+	}
+
+	lay := k.columnLayoutFor(colIdx, maxTasks)
+
+	// Check the fixed pinned block first
+	pinnedAreaLines := lay.fixedPinned * cardHeight
+	if taskAreaY < pinnedAreaLines {
+		pinnedIdx := taskAreaY / cardHeight
+		if pinnedIdx >= lay.fixedPinned {
+			return nil
+		}
+		k.selectedCol = colIdx
+		k.selectedRow = pinnedIdx
+		return col.Tasks[pinnedIdx]
+	}
+	taskAreaY -= pinnedAreaLines
+
+	// Account for scroll indicator line when scrolled
+	if lay.scrollOffset > 0 {
+		taskAreaY -= 1 // Subtract 1 for the "↑ N more" indicator line
+		if taskAreaY < 0 {
+			// Clicked on the scroll indicator
+			return nil
+		}
+	}
+
+	visibleTaskIdx := taskAreaY / cardHeight
+	if visibleTaskIdx >= lay.scrollCapacity {
+		return nil
+	}
+
+	// Convert visible index to actual task index
+	taskIdx := lay.fixedPinned + lay.scrollOffset + visibleTaskIdx
+	if taskIdx >= len(col.Tasks) {
+		return nil
+	}
+
+	// Update selection
+	k.selectedCol = colIdx
+	k.selectedRow = taskIdx
+
+	return col.Tasks[taskIdx]
+}
+
+// handleClickMobile handles clicks in mobile (single-column) mode.
+func (k *KanbanBoard) handleClickMobile(x, y int) *db.Task {
+	// Check if click is on the tab bar (first 2 lines)
+	tabBarHeight := 2
+	if y < tabBarHeight {
+		// Clicked on tab bar - determine which tab
+		numCols := len(k.columns)
+		tabWidth := (k.width - numCols - 1) / numCols
+		if tabWidth < 8 {
+			tabWidth = 8
+		}
+
+		colIdx := x / tabWidth
+		if colIdx >= numCols {
+			colIdx = numCols - 1
+		}
+		if colIdx >= 0 && colIdx < numCols {
+			k.selectedCol = colIdx
+			k.clampSelection()
+			k.ensureSelectedVisible()
+		}
+		return nil
+	}
+
+	// Click is in the column content area
+	// Column layout: tab bar (2 lines), then border (1 line), header (1 line), task cards
+	colHeight := k.height - tabBarHeight - 2
+	headerLines := 1 // Header bar is 1 line with no margin
+
+	// relY is position within the column content (after tab bar and top border)
+	relY := y - tabBarHeight - 1 // -1 for top border
+
+	// Skip header area
+	taskAreaY := relY - headerLines
+	if taskAreaY < 0 {
+		// Clicked on header
+		return nil
+	}
+
+	// Calculate which task was clicked
+	col := k.columns[k.selectedCol]
+	maxTasks := (colHeight - 3) / cardHeight
+	if maxTasks < 1 {
+		maxTasks = 1
+	}
+
+	lay := k.columnLayoutFor(k.selectedCol, maxTasks)
+
+	// Check the fixed pinned block first
+	pinnedAreaLines := lay.fixedPinned * cardHeight
+	if taskAreaY < pinnedAreaLines {
+		pinnedIdx := taskAreaY / cardHeight
+		if pinnedIdx >= lay.fixedPinned {
+			return nil
+		}
+		k.selectedRow = pinnedIdx
+		return col.Tasks[pinnedIdx]
+	}
+	taskAreaY -= pinnedAreaLines
+
+	// Account for scroll indicator line when scrolled
+	if lay.scrollOffset > 0 {
+		taskAreaY -= 1 // Subtract 1 for the "↑ N more" indicator line
+		if taskAreaY < 0 {
+			return nil
+		}
+	}
+
+	visibleTaskIdx := taskAreaY / cardHeight
+	if visibleTaskIdx >= lay.scrollCapacity {
+		return nil
+	}
+
+	// Convert visible index to actual task index
+	taskIdx := lay.fixedPinned + lay.scrollOffset + visibleTaskIdx
+	if taskIdx >= len(col.Tasks) {
+		return nil
+	}
+
+	// Update selection
+	k.selectedRow = taskIdx
+
+	return col.Tasks[taskIdx]
+}
