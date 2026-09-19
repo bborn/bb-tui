@@ -24,9 +24,9 @@ With Go:
 
     go install github.com/bborn/bb-tui/cmd/bb-tui@latest
 
-With Homebrew, once a release is tagged:
+With Homebrew:
 
-    brew install bborn/tap/bb-tui
+    brew install --cask bborn/tap/bb-tui
 
 Or take a binary from the [releases page](https://github.com/bborn/bb-tui/releases)
 — macOS and Linux, arm64 and amd64.
